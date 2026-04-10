@@ -1,350 +1,291 @@
 import express from 'express';
 import cors from 'cors';
 import ccxt from 'ccxt';
+import cron from 'node-cron';
+import { createClient } from '@supabase/supabase-js';
 import 'dotenv/config';
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3001;
+
+const supabase = createClient(
+  process.env.SUPABASE_URL      || 'https://nqaddvmjvoyxajztvkah.supabase.co',
+  process.env.SUPABASE_SERVICE_KEY || '',
+  { auth: { persistSession: false } }
+);
+
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TG_API    = `https://api.telegram.org/bot${BOT_TOKEN}`;
+const FRONTEND  = process.env.FRONTEND_URL || 'https://trader-diary-rust.vercel.app';
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// ── Exchange factory ──────────────────────────────────────────────────────────
-function makeExchange(exchangeId, apiKey, secret, passphrase) {
-  const cfg = { apiKey, secret, enableRateLimit: true, options: {} };
-  if (passphrase) cfg.password = passphrase;
-
-  switch (exchangeId.toLowerCase()) {
-    case 'binance':
-      return new ccxt.binance({ ...cfg, options: { defaultType: 'future' } });
-    case 'bybit':
-      return new ccxt.bybit({ ...cfg, options: { defaultType: 'linear' } });
-    case 'bingx':
-      return new ccxt.bingx({ ...cfg, options: { defaultType: 'swap' } });
-    default:
-      throw new Error(`Unsupported exchange: ${exchangeId}`);
-  }
-}
-
-// ── P&L Calculator (твоя логика, не биржевая) ────────────────────────────────
-function calcPnL(trade) {
-  const { side, entryPrice, exitPrice, amount, fee = 0 } = trade;
-  if (!exitPrice || !entryPrice || !amount) return null;
-  const gross = side === 'buy'
-    ? (exitPrice - entryPrice) * amount
-    : (entryPrice - exitPrice) * amount;
-  return parseFloat((gross - fee).toFixed(6));
-}
-
-function calcPnLPct(trade) {
-  const { entryPrice, exitPrice, side } = trade;
-  if (!exitPrice || !entryPrice) return null;
-  const pct = side === 'buy'
-    ? ((exitPrice - entryPrice) / entryPrice) * 100
-    : ((entryPrice - exitPrice) / entryPrice) * 100;
-  return parseFloat(pct.toFixed(4));
-}
-
-function calcRR(trade) {
-  const { entryPrice, stopLoss, takeProfit, side } = trade;
-  if (!stopLoss || !takeProfit || !entryPrice) return null;
-  const risk   = Math.abs(entryPrice - stopLoss);
-  const reward = Math.abs(takeProfit - entryPrice);
-  return risk > 0 ? parseFloat((reward / risk).toFixed(2)) : null;
-}
-
-function enrichTrade(raw) {
-  const pnl    = calcPnL(raw);
-  const pnlPct = calcPnLPct(raw);
-  const rr     = calcRR(raw);
-  return { ...raw, pnl, pnlPct, rr };
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function getHeaders(req) {
-  return {
-    apiKey:      req.headers['x-api-key']      || req.query.apiKey,
-    secret:      req.headers['x-api-secret']   || req.query.secret,
-    passphrase:  req.headers['x-passphrase']   || req.query.passphrase,
-    exchange:    req.headers['x-exchange']     || req.query.exchange || req.params.exchange,
-  };
+const wrap = fn => async (req, res) => {
+  try { await fn(req, res); }
+  catch (e) {
+    const code = e.message?.includes('401')||e.message?.includes('Auth') ? 401 : e.message?.includes('Not found') ? 404 : 500;
+    res.status(code).json({ ok: false, error: e.message || 'Unknown error' });
+  }
+};
+
+async function tgSend(chat_id, text, extra = {}) {
+  if (!BOT_TOKEN) return;
+  await fetch(`${TG_API}/sendMessage`, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ chat_id, text, parse_mode:'HTML', ...extra }),
+  });
 }
 
-function wrap(fn) {
-  return async (req, res) => {
+// ── P&L (наши расчёты) ────────────────────────────────────────────────────────
+const calcPnL = (dir, ep, xp, qty, fee=0) => {
+  if (!xp) return null;
+  return parseFloat(((dir==='long'?(xp-ep):(ep-xp))*qty - fee).toFixed(8));
+};
+const calcPnLPct = (dir, ep, xp) => {
+  if (!xp||!ep) return null;
+  return parseFloat(((dir==='long'?(xp-ep):(ep-xp))/ep*100).toFixed(4));
+};
+const calcRR = (ep, sl, tp) => {
+  if (!sl||!tp) return null;
+  const r=Math.abs(ep-sl), w=Math.abs(tp-ep);
+  return r>0 ? parseFloat((w/r).toFixed(2)) : null;
+};
+
+// ── Auth middleware ────────────────────────────────────────────────────────────
+async function requireAuth(req, res, next) {
+  const token = (req.headers.authorization||'').replace('Bearer ','').trim() || req.query.token || '';
+  if (!token) return res.status(401).json({ ok:false, error:'No auth token' });
+
+  const { data, error } = await supabase
+    .from('auth_tokens')
+    .select('telegram_user_id, expires_at, users(first_name, username)')
+    .eq('token', token).eq('revoked', false).gt('expires_at', new Date().toISOString())
+    .single();
+
+  if (error||!data) return res.status(401).json({ ok:false, error:'Invalid or expired token' });
+
+  const { data: sub } = await supabase
+    .from('subscriptions').select('id,status,expires_at')
+    .eq('telegram_user_id', data.telegram_user_id)
+    .in('status',['active','trial']).gt('expires_at', new Date().toISOString())
+    .order('expires_at',{ascending:false}).limit(1).single();
+
+  if (!sub) return res.status(403).json({ ok:false, error:'Subscription expired. Renew at @ParadoxxShop_bot' });
+
+  supabase.from('auth_tokens').update({last_used_at:new Date().toISOString()}).eq('token',token);
+  req.userId = data.telegram_user_id;
+  req.user   = data.users;
+  req.sub    = sub;
+  next();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// ROUTES
+// ═══════════════════════════════════════════════════════════════════
+
+app.get('/api/health', (_,res) => res.json({ ok:true, version:'2.0.0', time:new Date().toISOString() }));
+
+// Шаг 4: Верификация токена с фронтенда
+app.post('/api/auth/verify', wrap(async (req,res) => {
+  const { token } = req.body;
+  if (!token) return res.status(400).json({ ok:false, error:'token required' });
+
+  const { data, error } = await supabase.from('auth_tokens')
+    .select('telegram_user_id, expires_at, users(first_name, username)')
+    .eq('token', token).eq('revoked', false).gt('expires_at', new Date().toISOString()).single();
+  if (error||!data) return res.status(401).json({ ok:false, error:'Invalid or expired token' });
+
+  const { data: sub } = await supabase.from('subscriptions').select('expires_at,status')
+    .eq('telegram_user_id', data.telegram_user_id).in('status',['active','trial'])
+    .gt('expires_at', new Date().toISOString()).order('expires_at',{ascending:false}).limit(1).single();
+  if (!sub) return res.status(403).json({ ok:false, error:'No active subscription' });
+
+  res.json({ ok:true, token,
+    user:{ telegram_user_id:data.telegram_user_id, name:data.users?.first_name||'Trader', username:data.users?.username },
+    subscription:{ expires_at:sub.expires_at, status:sub.status }
+  });
+}));
+
+// Шаг 2: Telegram webhook (Stars payments + bot commands)
+app.post('/api/webhook/telegram', wrap(async (req,res) => {
+  const upd = req.body;
+  res.json({ ok:true });
+
+  // Pre-checkout (обязательно за <10с)
+  if (upd.pre_checkout_query) {
+    await fetch(`${TG_API}/answerPreCheckoutQuery`,{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({pre_checkout_query_id:upd.pre_checkout_query.id,ok:true})
+    });
+    return;
+  }
+
+  // Успешная оплата
+  if (upd.message?.successful_payment) {
+    const msg=upd.message, pay=msg.successful_payment, tg=msg.from;
+    const [slug] = pay.invoice_payload.split('|');
     try {
-      await fn(req, res);
-    } catch (e) {
-      const msg = e.message || 'Unknown error';
-      const status = msg.includes('AuthenticationError') || msg.includes('Invalid') ? 401
-        : msg.includes('Unsupported') ? 400 : 500;
-      res.status(status).json({ ok: false, error: msg });
-    }
-  };
+      await supabase.from('users').upsert({
+        telegram_user_id:tg.id, username:tg.username||null,
+        first_name:tg.first_name||null, last_name:tg.last_name||null,
+        updated_at:new Date().toISOString()
+      },{ onConflict:'telegram_user_id' });
+
+      const { data: prod } = await supabase.from('products').select('*').eq('slug',slug).single();
+      if (!prod) return;
+
+      const expiresAt = new Date(Date.now()+prod.duration_days*86400000).toISOString();
+
+      const { data: sub } = await supabase.from('subscriptions').insert({
+        telegram_user_id:tg.id, product_id:prod.slug, status:'active',
+        expires_at:expiresAt, payment_method:'stars', amount_paid:pay.total_amount
+      }).select().single();
+
+      const { data: tok } = await supabase.from('auth_tokens').insert({
+        telegram_user_id:tg.id, expires_at:expiresAt
+      }).select('token').single();
+
+      await supabase.from('telegram_events').insert({
+        event_type:'payment_success', telegram_user_id:tg.id, product_id:prod.slug,
+        payment_method:'stars', payment_tx_id:pay.telegram_payment_charge_id,
+        idempotency_key:pay.telegram_payment_charge_id,
+        related_subscription_id:sub?.id,
+        metadata:{ amount:pay.total_amount, currency:pay.currency }
+      });
+
+      const link = `${FRONTEND}?token=${tok?.token}`;
+      const exp  = new Date(expiresAt).toLocaleDateString('ru-RU');
+      await tgSend(tg.id,
+        `✅ <b>Оплата прошла!</b>\n\n📦 <b>${prod.name}</b>\n📅 До: <b>${exp}</b>\n\n`+
+        `🔗 <b>Войти в Trader Diary:</b>\n${link}\n\n`+
+        `💡 Это твой персональный ключ доступа.`
+      );
+    } catch(e) { console.error('Webhook payment error:',e.message); }
+    return;
+  }
+
+  // /start
+  if (upd.message?.text?.startsWith('/start')) {
+    const tg = upd.message.from;
+    await tgSend(tg.id,
+      `👋 <b>Привет, ${tg.first_name}!</b>\n\n`+
+      `📊 <b>Trader Diary</b> — профессиональный торговый журнал.\n\n`+
+      `• Подключение Binance / Bybit / BingX\n`+
+      `• P&L с нашими расчётами (не биржевыми)\n`+
+      `• Аналитика, equity curve, breakdown по сетапам\n\n`+
+      `🛍 Купить доступ: @ParadoxxShop_bot`
+    );
+  }
+}));
+
+// ── Trades API (Supabase) ─────────────────────────────────────────────────────
+app.get('/api/trades', requireAuth, wrap(async (req,res) => {
+  const { data, error } = await supabase.from('trades').select('*')
+    .eq('telegram_user_id', req.userId).order('entry_date',{ascending:false});
+  if (error) throw new Error(error.message);
+  res.json({ ok:true, count:data.length, trades:data });
+}));
+
+app.post('/api/trades', requireAuth, wrap(async (req,res) => {
+  const t=req.body;
+  const ep=+t.entry_price, xp=t.exit_price?+t.exit_price:null, qty=+t.quantity;
+  const { data, error } = await supabase.from('trades').insert({
+    telegram_user_id:req.userId,
+    symbol:t.symbol?.toUpperCase(), direction:t.direction,
+    status:t.status||'open', entry_price:ep, exit_price:xp, quantity:qty,
+    entry_date:t.entry_date, exit_date:t.exit_date||null,
+    stop_loss:t.stop_loss?+t.stop_loss:null, take_profit:t.take_profit?+t.take_profit:null,
+    pnl:calcPnL(t.direction,ep,xp,qty), pnl_pct:calcPnLPct(t.direction,ep,xp),
+    rr:calcRR(ep,+t.stop_loss,+t.take_profit),
+    setup:t.setup||null, emotion:t.emotion||null, notes:t.notes||null,
+    exchange:t.exchange||'manual'
+  }).select().single();
+  if (error) throw new Error(error.message);
+  res.json({ ok:true, trade:data });
+}));
+
+app.patch('/api/trades/:id', requireAuth, wrap(async (req,res) => {
+  const t=req.body, ep=+t.entry_price, xp=t.exit_price?+t.exit_price:null, qty=+t.quantity;
+  const upd = { ...t, updated_at:new Date().toISOString() };
+  if (xp) { upd.pnl=calcPnL(t.direction,ep,xp,qty); upd.pnl_pct=calcPnLPct(t.direction,ep,xp); upd.status='closed'; }
+  const { data, error } = await supabase.from('trades').update(upd)
+    .eq('id',req.params.id).eq('telegram_user_id',req.userId).select().single();
+  if (error) throw new Error(error.message);
+  res.json({ ok:true, trade:data });
+}));
+
+app.delete('/api/trades/:id', requireAuth, wrap(async (req,res) => {
+  const { error } = await supabase.from('trades').delete()
+    .eq('id',req.params.id).eq('telegram_user_id',req.userId);
+  if (error) throw new Error(error.message);
+  res.json({ ok:true });
+}));
+
+// ── Exchange routes (с auth) ──────────────────────────────────────────────────
+function mkEx(id, k, s) {
+  const cfg={apiKey:k,secret:s,enableRateLimit:true};
+  if(id==='binance') return new ccxt.binance({...cfg,options:{defaultType:'future'}});
+  if(id==='bybit')   return new ccxt.bybit({...cfg,options:{defaultType:'linear'}});
+  if(id==='bingx')   return new ccxt.bingx({...cfg,options:{defaultType:'swap'}});
+  throw new Error(`Unsupported: ${id}`);
 }
 
-// ── Routes ────────────────────────────────────────────────────────────────────
-
-// Health
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, time: new Date().toISOString(), version: '1.0.0',
-    supported: ['binance', 'bybit', 'bingx'] });
-});
-
-// Validate API keys
-app.post('/api/connect', wrap(async (req, res) => {
-  const { exchange, apiKey, secret, passphrase } = req.body;
-  if (!exchange || !apiKey || !secret) return res.status(400).json({ ok: false, error: 'exchange, apiKey, secret required' });
-
-  const ex = makeExchange(exchange, apiKey, secret, passphrase);
-  const bal = await ex.fetchBalance();
-  const total = bal.total?.USDT || bal.total?.USD || 0;
-
-  res.json({ ok: true, exchange, balance: parseFloat(total.toFixed(2)),
-    currencies: Object.keys(bal.total).filter(k => bal.total[k] > 0).slice(0, 10) });
+app.post('/api/connect', requireAuth, wrap(async (req,res) => {
+  const {exchange,apiKey,secret}=req.body;
+  const ex=mkEx(exchange,apiKey,secret);
+  const bal=await ex.fetchBalance();
+  res.json({ok:true,exchange,balance:+(bal.total?.USDT||0).toFixed(2)});
 }));
 
-// Balance
-app.get('/api/:exchange/balance', wrap(async (req, res) => {
-  const { exchange, apiKey, secret, passphrase } = getHeaders(req);
-  if (!apiKey || !secret) return res.status(400).json({ ok: false, error: 'x-api-key and x-api-secret headers required' });
-
-  const ex = makeExchange(exchange, apiKey, secret, passphrase);
-  const bal = await ex.fetchBalance();
-
-  const wallets = {};
-  for (const [currency, total] of Object.entries(bal.total)) {
-    if (total > 0) {
-      wallets[currency] = {
-        total: parseFloat(total.toFixed(8)),
-        free:  parseFloat((bal.free[currency]  || 0).toFixed(8)),
-        used:  parseFloat((bal.used[currency]  || 0).toFixed(8)),
-      };
-    }
-  }
-
-  res.json({ ok: true, exchange, wallets,
-    usdtTotal: parseFloat((bal.total?.USDT || bal.total?.USD || 0).toFixed(2)) });
+app.get('/api/:exchange/balance', requireAuth, wrap(async (req,res) => {
+  const {apiKey,secret}=req.query;
+  const ex=mkEx(req.params.exchange,apiKey,secret);
+  const bal=await ex.fetchBalance();
+  const w={};
+  for(const[k,v] of Object.entries(bal.total)) if(v>0) w[k]={total:+v.toFixed(8),free:+(bal.free[k]||0).toFixed(8)};
+  res.json({ok:true,exchange:req.params.exchange,wallets:w,usdtTotal:+(bal.total?.USDT||0).toFixed(2)});
 }));
 
-// Open positions
-app.get('/api/:exchange/positions', wrap(async (req, res) => {
-  const { exchange, apiKey, secret, passphrase } = getHeaders(req);
-  if (!apiKey || !secret) return res.status(400).json({ ok: false, error: 'Headers required' });
-
-  const ex = makeExchange(exchange, apiKey, secret, passphrase);
-  const positions = await ex.fetchPositions();
-
-  const active = positions
-    .filter(p => p.contracts && parseFloat(p.contracts) > 0)
-    .map(p => ({
-      id:           p.id,
-      symbol:       p.symbol,
-      side:         p.side,
-      size:         parseFloat(p.contracts || 0),
-      entryPrice:   parseFloat(p.entryPrice || 0),
-      markPrice:    parseFloat(p.markPrice  || 0),
-      notional:     parseFloat(p.notional   || 0),
-      leverage:     p.leverage,
-      liquidation:  parseFloat(p.liquidationPrice || 0),
-      unrealizedPnl: parseFloat((p.unrealizedPnl || 0).toFixed(4)),
-      // твой расчёт P&L%
-      pnlPct: p.entryPrice && p.markPrice
-        ? parseFloat((((p.markPrice - p.entryPrice) / p.entryPrice * 100) * (p.side === 'short' ? -1 : 1)).toFixed(3))
-        : null,
-      margin:   parseFloat(p.initialMargin || 0),
-      exchange,
-    }));
-
-  res.json({ ok: true, exchange, count: active.length, positions: active });
-}));
-
-// Closed trades history (твои расчёты P&L)
-app.get('/api/:exchange/trades', wrap(async (req, res) => {
-  const { exchange, apiKey, secret, passphrase } = getHeaders(req);
-  if (!apiKey || !secret) return res.status(400).json({ ok: false, error: 'Headers required' });
-
-  const symbol = req.query.symbol || undefined;
-  const since  = req.query.since  ? parseInt(req.query.since)  : Date.now() - 90 * 86400000;
-  const limit  = req.query.limit  ? parseInt(req.query.limit)  : 200;
-
-  const ex = makeExchange(exchange, apiKey, secret, passphrase);
-
-  let raw = [];
-  if (symbol) {
-    raw = await ex.fetchMyTrades(symbol, since, limit);
-  } else {
-    // Fetch for common pairs if no symbol given
-    const markets = await ex.loadMarkets();
-    const usdtPairs = Object.keys(markets)
-      .filter(s => s.endsWith('/USDT:USDT') || s.endsWith('/USDT'))
-      .slice(0, 20);
-
-    for (const sym of usdtPairs) {
-      try {
-        const trades = await ex.fetchMyTrades(sym, since, limit);
-        raw = [...raw, ...trades];
-      } catch { /* skip unsupported pair */ }
-    }
-  }
-
-  // Group buy/sell into round trips, compute our P&L
-  const trades = matchTrades(raw, exchange);
-  res.json({ ok: true, exchange, count: trades.length, trades });
-}));
-
-// Order history (open + closed orders)
-app.get('/api/:exchange/orders', wrap(async (req, res) => {
-  const { exchange, apiKey, secret, passphrase } = getHeaders(req);
-  if (!apiKey || !secret) return res.status(400).json({ ok: false, error: 'Headers required' });
-
-  const symbol = req.query.symbol || undefined;
-  const since  = req.query.since  ? parseInt(req.query.since) : Date.now() - 30 * 86400000;
-
-  const ex = makeExchange(exchange, apiKey, secret, passphrase);
-  let orders = [];
-
-  if (symbol) {
-    orders = await ex.fetchOrders(symbol, since);
-  } else {
-    const openOrders = await ex.fetchOpenOrders();
-    orders = openOrders;
-  }
-
-  const mapped = orders.map(o => ({
-    id:       o.id,
-    symbol:   o.symbol,
-    side:     o.side,
-    type:     o.type,
-    status:   o.status,
-    price:    o.price,
-    amount:   o.amount,
-    filled:   o.filled,
-    remaining:o.remaining,
-    cost:     o.cost,
-    timestamp: o.timestamp,
-    datetime:  o.datetime,
-    exchange,
+app.get('/api/:exchange/positions', requireAuth, wrap(async (req,res) => {
+  const {apiKey,secret}=req.query;
+  const ex=mkEx(req.params.exchange,apiKey,secret);
+  const pos=(await ex.fetchPositions()).filter(p=>+(p.contracts||0)>0).map(p=>({
+    symbol:p.symbol,side:p.side,size:+p.contracts,entryPrice:+p.entryPrice,
+    markPrice:+p.markPrice,unrealizedPnl:+p.unrealizedPnl,leverage:p.leverage,
+    pnlPct:p.entryPrice&&p.markPrice?+((p.markPrice-p.entryPrice)/p.entryPrice*100*(p.side==='short'?-1:1)).toFixed(3):null,
+    exchange:req.params.exchange
   }));
-
-  res.json({ ok: true, exchange, count: mapped.length, orders: mapped });
+  res.json({ok:true,count:pos.length,positions:pos});
 }));
 
-// ── P&L summary across all trades ────────────────────────────────────────────
-app.get('/api/:exchange/pnl', wrap(async (req, res) => {
-  const { exchange, apiKey, secret, passphrase } = getHeaders(req);
-  if (!apiKey || !secret) return res.status(400).json({ ok: false, error: 'Headers required' });
-
-  const since = req.query.since ? parseInt(req.query.since) : Date.now() - 30 * 86400000;
-  const ex = makeExchange(exchange, apiKey, secret, passphrase);
-
-  const markets = await ex.loadMarkets();
-  const pairs = Object.keys(markets).filter(s => s.includes('USDT')).slice(0, 15);
-
-  let allTrades = [];
-  for (const sym of pairs) {
-    try { allTrades = [...allTrades, ...await ex.fetchMyTrades(sym, since, 100)]; }
-    catch {}
-  }
-
-  const matched = matchTrades(allTrades, exchange);
-
-  const summary = {
-    totalTrades:  matched.length,
-    wins:         matched.filter(t => (t.pnl||0) > 0).length,
-    losses:       matched.filter(t => (t.pnl||0) < 0).length,
-    totalPnl:     parseFloat(matched.reduce((s,t) => s + (t.pnl||0), 0).toFixed(4)),
-    bestTrade:    matched.reduce((m,t) => Math.max(m, t.pnl||0), -Infinity),
-    worstTrade:   matched.reduce((m,t) => Math.min(m, t.pnl||0), Infinity),
-    avgWin:       0, avgLoss: 0, profitFactor: 0, winRate: 0,
-  };
-
-  const wins   = matched.filter(t => (t.pnl||0) > 0).map(t => t.pnl||0);
-  const losses = matched.filter(t => (t.pnl||0) < 0).map(t => t.pnl||0);
-  summary.avgWin       = wins.length   ? parseFloat((wins.reduce((a,b)=>a+b,0)/wins.length).toFixed(4))   : 0;
-  summary.avgLoss      = losses.length ? parseFloat((losses.reduce((a,b)=>a+b,0)/losses.length).toFixed(4)): 0;
-  summary.profitFactor = summary.avgLoss ? parseFloat((-summary.avgWin / summary.avgLoss).toFixed(3)) : 0;
-  summary.winRate      = matched.length  ? parseFloat((summary.wins / matched.length * 100).toFixed(2))    : 0;
-
-  res.json({ ok: true, exchange, period: { since: new Date(since).toISOString(), to: new Date().toISOString() }, summary, trades: matched });
-}));
-
-// ── Trade matching logic (buy → sell pairs, твои расчёты) ────────────────────
-function matchTrades(rawTrades, exchange) {
-  // Sort by time
-  const sorted = [...rawTrades].sort((a, b) => a.timestamp - b.timestamp);
-
-  // Group by symbol
-  const bySymbol = {};
-  for (const t of sorted) {
-    if (!bySymbol[t.symbol]) bySymbol[t.symbol] = [];
-    bySymbol[t.symbol].push(t);
-  }
-
-  const result = [];
-
-  for (const [symbol, trades] of Object.entries(bySymbol)) {
-    // Simple FIFO matching
-    const buys  = trades.filter(t => t.side === 'buy');
-    const sells = trades.filter(t => t.side === 'sell');
-
-    const matched = Math.min(buys.length, sells.length);
-    for (let i = 0; i < matched; i++) {
-      const buy  = buys[i];
-      const sell = sells[i];
-      const fee  = (buy.fee?.cost || 0) + (sell.fee?.cost || 0);
-
-      const trade = {
-        id:          `${buy.id}_${sell.id}`,
-        symbol,
-        exchange,
-        direction:   'long',
-        status:      'closed',
-        entryPrice:  parseFloat((buy.price  || buy.average || 0).toFixed(6)),
-        exitPrice:   parseFloat((sell.price || sell.average || 0).toFixed(6)),
-        amount:      parseFloat((buy.amount || 0).toFixed(6)),
-        fee:         parseFloat(fee.toFixed(6)),
-        entryDate:   new Date(buy.timestamp).toISOString().slice(0, 10),
-        exitDate:    new Date(sell.timestamp).toISOString().slice(0, 10),
-        entryTs:     buy.timestamp,
-        exitTs:      sell.timestamp,
-        side:        'buy',
-      };
-      result.push(enrichTrade(trade));
+// Шаг 5: Cron — напоминания ───────────────────────────────────────────────────
+async function sendReminders() {
+  const now=new Date();
+  for(const [days, type] of [[5,'5day'],[1,'1day']]) {
+    const from=new Date(now.getTime()+days*86400000).toISOString();
+    const to  =new Date(now.getTime()+(days+1)*86400000).toISOString();
+    const {data:subs}=await supabase.from('subscriptions').select('id,telegram_user_id,expires_at')
+      .eq('status','active').gt('expires_at',from).lt('expires_at',to);
+    for(const sub of subs||[]) {
+      const {error}=await supabase.from('reminder_log').insert({
+        telegram_user_id:sub.telegram_user_id, subscription_id:sub.id, reminder_type:type
+      });
+      if(!error) {
+        const d=new Date(sub.expires_at).toLocaleDateString('ru-RU');
+        await tgSend(sub.telegram_user_id, days===5
+          ? `⏰ <b>Подписка истекает через 5 дней</b>\n📅 До: <b>${d}</b>\n\n🔄 Продли со скидкой 20%: @ParadoxxShop_bot`
+          : `🚨 <b>Последний день подписки!</b>\n\nЗавтра доступ закроется.\n⚡ Продли: @ParadoxxShop_bot`
+        );
+      }
     }
-
-    // Unmatched sells (short side)
-    for (let i = matched; i < sells.length; i++) {
-      const sell = sells[i];
-      const correspondingBuy = buys[matched + i] || null;
-      if (!correspondingBuy) continue;
-      const fee = (sell.fee?.cost || 0) + (correspondingBuy.fee?.cost || 0);
-      const trade = {
-        id:        `${sell.id}_short`,
-        symbol,
-        exchange,
-        direction: 'short',
-        status:    'closed',
-        entryPrice: parseFloat((sell.price || sell.average || 0).toFixed(6)),
-        exitPrice:  parseFloat((correspondingBuy.price || correspondingBuy.average || 0).toFixed(6)),
-        amount:    parseFloat((sell.amount || 0).toFixed(6)),
-        fee:       parseFloat(fee.toFixed(6)),
-        entryDate: new Date(sell.timestamp).toISOString().slice(0, 10),
-        exitDate:  new Date(correspondingBuy.timestamp).toISOString().slice(0, 10),
-        entryTs:   sell.timestamp,
-        exitTs:    correspondingBuy.timestamp,
-        side:      'sell',
-      };
-      result.push(enrichTrade(trade));
-    }
+    console.log(`[CRON] ${type} reminders: ${subs?.length||0}`);
   }
-
-  return result.sort((a, b) => b.entryTs - a.entryTs);
+  // Помечаем просроченные
+  await supabase.from('subscriptions').update({status:'expired'}).eq('status','active').lt('expires_at',now.toISOString());
 }
 
-// ── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`🚀 Trader Diary API running on port ${PORT}`);
-  console.log(`   Supported: Binance | Bybit | BingX`);
-  console.log(`   P&L: custom server-side calculations`);
-});
+cron.schedule('0 10 * * *', sendReminders);
+
+app.listen(PORT, () => console.log(`🚀 API v2 on :${PORT} — auth+trades+cron ready`));
