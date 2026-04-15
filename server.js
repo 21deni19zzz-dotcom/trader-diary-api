@@ -85,7 +85,7 @@ async function requireAuth(req, res, next) {
 // ROUTES
 // ═══════════════════════════════════════════════════════════════════
 
-app.get('/api/health', (_,res) => res.json({ ok:true, version:'2.0.0', time:new Date().toISOString() }));
+app.get('/api/health', (_,res) => res.json({ ok:true, version:'2.1.0', time:new Date().toISOString() }));
 
 // Шаг 4: Верификация токена с фронтенда
 app.post('/api/auth/verify', wrap(async (req,res) => {
