@@ -208,6 +208,11 @@ app.post('/api/webhook/telegram', wrap(async (req, res) => {
         telegram_user_id: tg.id, product_id: prod.slug, status: 'active',
         expires_at: expiresAt, payment_method: 'stars', amount_paid: pay.total_amount
       }).select().single();
+
+      // Revoke any existing active tokens before creating new one (renewal cleanup)
+      await supabase.from('auth_tokens').update({ revoked: true })
+        .eq('telegram_user_id', tg.id).eq('revoked', false);
+
       const { data: tok } = await supabase.from('auth_tokens').insert({
         telegram_user_id: tg.id, expires_at: expiresAt
       }).select('token').single();
@@ -389,7 +394,27 @@ async function sendReminders() {
     }
     console.log(`[CRON] ${type}: ${subs?.length || 0}`);
   }
-  await supabase.from('subscriptions').update({ status: 'expired' }).eq('status', 'active').lt('expires_at', now.toISOString());
+
+  // Mark expired subscriptions and revoke their tokens
+  const { data: expiredSubs } = await supabase.from('subscriptions')
+    .select('telegram_user_id')
+    .eq('status', 'active').lt('expires_at', now.toISOString());
+
+  await supabase.from('subscriptions').update({ status: 'expired' })
+    .eq('status', 'active').lt('expires_at', now.toISOString());
+
+  // Revoke tokens of users whose subscription just expired
+  if (expiredSubs?.length) {
+    const userIds = [...new Set(expiredSubs.map(s => s.telegram_user_id))];
+    const { count } = await supabase.from('auth_tokens')
+      .update({ revoked: true }, { count: 'exact' })
+      .in('telegram_user_id', userIds).eq('revoked', false);
+    console.log(`[CRON] expired ${expiredSubs.length} subs, revoked ${count || 0} tokens`);
+  }
+
+  // Also revoke any tokens that expired themselves (safety net)
+  await supabase.from('auth_tokens').update({ revoked: true })
+    .eq('revoked', false).lt('expires_at', now.toISOString());
 }
 cron.schedule('0 10 * * *', sendReminders);
 
