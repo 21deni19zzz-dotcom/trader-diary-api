@@ -219,7 +219,10 @@ app.post('/api/webhook/telegram', wrap(async (req, res) => {
       });
       const link = `${FRONTEND}?token=${tok?.token}`;
       const exp = new Date(expiresAt).toLocaleDateString('ru-RU');
-      await tgSend(tg.id, `✅ <b>Оплата прошла!</b>\n\n📦 <b>${prod.name}</b>\n📅 До: <b>${exp}</b>\n\n🔗 <b>Войти:</b>\n${link}\n\n💡 Персональный ключ доступа.`);
+      // Message 1: confirmation + login link
+      await tgSend(tg.id, `✅ <b>Доступ открыт!</b>\n\n📦 <b>${prod.name}</b>\n📅 До: <b>${exp}</b>\n\n🔗 <b>Войти одним кликом:</b>\n${link}\n\n💡 Персональный ключ — не передавай.`);
+      // Message 2: token separately for manual copy/paste backup
+      await tgSend(tg.id, `🔐 <b>Твой персональный токен доступа</b>\n\n<code>${tok?.token}</code>\n\n💡 Скопируй и сохрани этот токен. Если ссылка не работает — вставь токен вручную на странице входа:\n${FRONTEND}\n\n⚠️ Не передавай токен третьим лицам — это ключ к твоему журналу.`);
     } catch (e) { console.error('Webhook error:', e.message); }
     return;
   }
