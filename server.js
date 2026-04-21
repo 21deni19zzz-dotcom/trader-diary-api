@@ -101,6 +101,45 @@ function decrypt(data) {
 }
 
 // ── Validation ────────────────────────────────────────────────────────────────
+function validateFills(fills, errArr) {
+  if (fills == null || fills === '') return [];
+  if (!Array.isArray(fills)) { errArr.push('fills: must be array'); return []; }
+  if (fills.length > 50) { errArr.push('fills: max 50 entries'); return []; }
+  const out = [];
+  const safeNote = s => s ? String(s).slice(0, 200).replace(/<[^>]*>/g, '') : null;
+  for (let i = 0; i < fills.length; i++) {
+    const f = fills[i] || {};
+    const q = parseFloat(f.qty);
+    const p = parseFloat(f.price);
+    if (isNaN(q) || q <= 0) { errArr.push(`fills[${i}].qty: positive number`); continue; }
+    if (isNaN(p) || p <= 0) { errArr.push(`fills[${i}].price: positive number`); continue; }
+    out.push({
+      id: typeof f.id === 'string' ? f.id.slice(0, 64) : null,
+      qty: q,
+      price: p,
+      date: f.date && typeof f.date === 'string' ? f.date.slice(0, 10) : new Date().toISOString().slice(0, 10),
+      note: safeNote(f.note),
+      pnl: f.pnl != null && !isNaN(parseFloat(f.pnl)) ? parseFloat(f.pnl) : null,
+      created_at: f.created_at && typeof f.created_at === 'string' ? f.created_at : new Date().toISOString(),
+    });
+  }
+  return out;
+}
+
+const sumFillsQty = fs => (fs || []).reduce((s, f) => s + +f.qty, 0);
+const fillsWavgPrice = fs => {
+  const tq = sumFillsQty(fs);
+  if (!tq) return null;
+  return fs.reduce((s, f) => s + +f.qty * +f.price, 0) / tq;
+};
+const fillsRealizedPnL = (fs, dir, ep) => {
+  if (!fs || !fs.length) return 0;
+  return fs.reduce((s, f) => {
+    const fp = f.pnl != null ? +f.pnl : (dir === 'long' ? (+f.price - ep) * +f.qty : (ep - +f.price) * +f.qty);
+    return s + fp;
+  }, 0);
+};
+
 function validateTrade(t) {
   const err = [];
   if (!t.symbol || typeof t.symbol !== 'string' || t.symbol.trim().length < 2 || t.symbol.trim().length > 20)
@@ -120,9 +159,10 @@ function validateTrade(t) {
   if (t.take_profit != null && t.take_profit !== '') {
     const tp = parseFloat(t.take_profit); if (isNaN(tp) || tp <= 0) err.push('take_profit: positive');
   }
+  const fillsClean = validateFills(t.fills, err);
   const safe = s => s ? String(s).slice(0, 200).replace(/<[^>]*>/g, '') : null;
   return { err, clean: {
-    symbol: t.symbol.toUpperCase().trim().slice(0, 20), direction: t.direction,
+    symbol: String(t.symbol || '').toUpperCase().trim().slice(0, 20), direction: t.direction,
     status: t.status || 'open',
     entry_price: ep, exit_price: t.exit_price != null && t.exit_price !== '' ? parseFloat(t.exit_price) : null,
     quantity: qty,
@@ -131,6 +171,7 @@ function validateTrade(t) {
     take_profit: t.take_profit != null && t.take_profit !== '' ? parseFloat(t.take_profit) : null,
     setup: safe(t.setup), emotion: safe(t.emotion), notes: safe(t.notes),
     exchange: safe(t.exchange) || 'manual',
+    fills: fillsClean,
   }};
 }
 
@@ -257,6 +298,7 @@ app.post('/api/trades', requireAuth, wrap(async (req, res) => {
     pnl_pct: calcPnLPct(t.direction, t.entry_price, t.exit_price),
     rr: calcRR(t.entry_price, t.stop_loss, t.take_profit),
     setup: t.setup, emotion: t.emotion, notes: t.notes, exchange: t.exchange,
+    fills: t.fills,
   }).select().single();
   if (error) throw new Error(error.message);
   res.json({ ok: true, trade: data });
@@ -267,16 +309,37 @@ app.patch('/api/trades/:id', requireAuth, wrap(async (req, res) => {
   if (!id) throw new Error('Validation: invalid trade ID');
   const { err: e, clean: t } = validateTrade(req.body);
   if (e.length) throw new Error(`Validation: ${e.join('; ')}`);
+
   const upd = { symbol: t.symbol, direction: t.direction, status: t.status,
     entry_price: t.entry_price, exit_price: t.exit_price, quantity: t.quantity,
     entry_date: t.entry_date, exit_date: t.exit_date, stop_loss: t.stop_loss, take_profit: t.take_profit,
     setup: t.setup, emotion: t.emotion, notes: t.notes,
-    pnl: calcPnL(t.direction, t.entry_price, t.exit_price, t.quantity),
-    pnl_pct: calcPnLPct(t.direction, t.entry_price, t.exit_price),
-    rr: calcRR(t.entry_price, t.stop_loss, t.take_profit),
+    fills: t.fills,
     updated_at: new Date().toISOString(),
   };
-  if (t.exit_price) upd.status = 'closed';
+
+  // Auto-close when partial fills sum up to full quantity
+  const closedQty = sumFillsQty(t.fills);
+  const fullyFilled = t.fills.length > 0 && Math.abs(closedQty - t.quantity) < 1e-9;
+  if (fullyFilled) {
+    upd.status = 'closed';
+    if (upd.exit_price == null) upd.exit_price = fillsWavgPrice(t.fills);
+    if (upd.exit_date == null) upd.exit_date = t.fills[t.fills.length - 1].date;
+  }
+  // Legacy: single-exit trigger
+  if (upd.exit_price) upd.status = 'closed';
+
+  // P&L: prefer fills when present, else classic exit-price calc
+  if (t.fills.length > 0) {
+    upd.pnl = +fillsRealizedPnL(t.fills, t.direction, t.entry_price).toFixed(8);
+    const entryValue = t.entry_price * t.quantity;
+    upd.pnl_pct = entryValue > 0 ? +((upd.pnl / entryValue) * 100).toFixed(4) : null;
+  } else {
+    upd.pnl = calcPnL(t.direction, t.entry_price, upd.exit_price, t.quantity);
+    upd.pnl_pct = calcPnLPct(t.direction, t.entry_price, upd.exit_price);
+  }
+  upd.rr = calcRR(t.entry_price, t.stop_loss, t.take_profit);
+
   const { data, error } = await supabase.from('trades').update(upd)
     .eq('id', id).eq('telegram_user_id', req.userId).select().single();
   if (error) throw new Error(error.message);
