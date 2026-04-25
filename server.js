@@ -126,6 +126,32 @@ function validateFills(fills, errArr) {
   return out;
 }
 
+function validateShots(shots, errArr) {
+  if (shots == null || shots === '') return [];
+  if (!Array.isArray(shots)) { errArr.push('shots: must be array'); return []; }
+  if (shots.length > 8) { errArr.push('shots: max 8 entries'); return []; }
+  const out = [];
+  for (let i = 0; i < shots.length; i++) {
+    const s = shots[i] || {};
+    const id  = typeof s.id  === 'string' ? s.id.slice(0, 64)   : null;
+    const url = typeof s.url === 'string' ? s.url.slice(0, 1000) : null;
+    if (!id)  { errArr.push(`shots[${i}].id: required string`);  continue; }
+    if (!url) { errArr.push(`shots[${i}].url: required string`); continue; }
+    // Accept https://... and supabase storage paths
+    if (!/^https?:\/\//i.test(url) && !url.startsWith('ptj-screenshots/')) {
+      errArr.push(`shots[${i}].url: must be http(s) URL or ptj-screenshots/ path`); continue;
+    }
+    out.push({
+      id,
+      url,
+      uploaded_at: s.uploaded_at && typeof s.uploaded_at === 'string'
+        ? s.uploaded_at
+        : new Date().toISOString(),
+    });
+  }
+  return out;
+}
+
 const sumFillsQty = fs => (fs || []).reduce((s, f) => s + +f.qty, 0);
 const fillsWavgPrice = fs => {
   const tq = sumFillsQty(fs);
@@ -160,6 +186,7 @@ function validateTrade(t) {
     const tp = parseFloat(t.take_profit); if (isNaN(tp) || tp <= 0) err.push('take_profit: positive');
   }
   const fillsClean = validateFills(t.fills, err);
+  const shotsClean = validateShots(t.shots, err);
   const safe = s => s ? String(s).slice(0, 200).replace(/<[^>]*>/g, '') : null;
   return { err, clean: {
     symbol: String(t.symbol || '').toUpperCase().trim().slice(0, 20), direction: t.direction,
@@ -172,6 +199,7 @@ function validateTrade(t) {
     setup: safe(t.setup), emotion: safe(t.emotion), notes: safe(t.notes),
     exchange: safe(t.exchange) || 'manual',
     fills: fillsClean,
+    shots: shotsClean,
   }};
 }
 
@@ -299,6 +327,7 @@ app.post('/api/trades', requireAuth, wrap(async (req, res) => {
     rr: calcRR(t.entry_price, t.stop_loss, t.take_profit),
     setup: t.setup, emotion: t.emotion, notes: t.notes, exchange: t.exchange,
     fills: t.fills,
+    shots: t.shots,
   }).select().single();
   if (error) throw new Error(error.message);
   res.json({ ok: true, trade: data });
@@ -315,6 +344,7 @@ app.patch('/api/trades/:id', requireAuth, wrap(async (req, res) => {
     entry_date: t.entry_date, exit_date: t.exit_date, stop_loss: t.stop_loss, take_profit: t.take_profit,
     setup: t.setup, emotion: t.emotion, notes: t.notes,
     fills: t.fills,
+    shots: t.shots,
     updated_at: new Date().toISOString(),
   };
 
