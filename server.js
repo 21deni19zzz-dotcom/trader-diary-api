@@ -4,6 +4,7 @@ import ccxt from 'ccxt';
 import cron from 'node-cron';
 import crypto from 'node:crypto';
 import { createClient } from '@supabase/supabase-js';
+import multer from 'multer';
 import 'dotenv/config';
 
 const app  = express();
@@ -383,6 +384,93 @@ app.delete('/api/trades/:id', requireAuth, wrap(async (req, res) => {
   if (error) throw new Error(error.message);
   res.json({ ok: true });
 }));
+
+// ── Uploads (Sprint 5: Journal screenshots) ───────────────────────────────────
+// Multer in-memory storage, 5MB limit, image MIME whitelist.
+// Owner enforced server-side: path = {telegram_user_id}/{trade_id}/{uuid}.{ext}
+// Bucket ptj-screenshots is public → public URL works without signing.
+const SHOT_BUCKET = 'ptj-screenshots';
+const SHOT_MIMES  = new Set(['image/png', 'image/jpeg', 'image/webp']);
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024, files: 1 }, // 5 MB
+  fileFilter: (_req, file, cb) => {
+    if (!SHOT_MIMES.has(file.mimetype)) {
+      return cb(new Error(`Unsupported MIME: ${file.mimetype}`));
+    }
+    cb(null, true);
+  },
+});
+
+const extOf = (mime) => ({
+  'image/png':  'png',
+  'image/jpeg': 'jpg',
+  'image/webp': 'webp',
+}[mime] || 'bin');
+
+app.post('/api/uploads/screenshot', requireAuth, (req, res) => {
+  upload.single('file')(req, res, async (err) => {
+    if (err) return res.status(400).json({ ok: false, error: err.message });
+    if (!req.file) return res.status(400).json({ ok: false, error: 'No file' });
+
+    const tradeId = String(req.body.trade_id || '').slice(0, 64);
+    if (!tradeId) return res.status(400).json({ ok: false, error: 'trade_id required' });
+
+    // Verify trade belongs to user (defence in depth)
+    const { data: trade, error: tradeErr } = await supabase.from('trades')
+      .select('id').eq('id', tradeId).eq('telegram_user_id', req.userId).single();
+    if (tradeErr || !trade) {
+      return res.status(404).json({ ok: false, error: 'Trade not found' });
+    }
+
+    // Build path: {tg_user_id}/{trade_id}/{uuid}.{ext}
+    const id   = crypto.randomUUID();
+    const ext  = extOf(req.file.mimetype);
+    const path = `${req.userId}/${tradeId}/${id}.${ext}`;
+
+    const { error: upErr } = await supabase.storage.from(SHOT_BUCKET).upload(
+      path, req.file.buffer,
+      { contentType: req.file.mimetype, upsert: false }
+    );
+    if (upErr) {
+      console.error('[upload]', upErr.message);
+      return res.status(500).json({ ok: false, error: 'Upload failed' });
+    }
+
+    const { data: pub } = supabase.storage.from(SHOT_BUCKET).getPublicUrl(path);
+    const url = pub?.publicUrl;
+    if (!url) return res.status(500).json({ ok: false, error: 'Public URL unavailable' });
+
+    res.json({
+      ok: true,
+      shot: {
+        id,
+        url,
+        path,
+        uploaded_at: new Date().toISOString(),
+      },
+    });
+  });
+});
+
+app.delete('/api/uploads/screenshot', requireAuth, express.json(), async (req, res) => {
+  const path = String(req.body.path || '');
+  if (!path) return res.status(400).json({ ok: false, error: 'path required' });
+
+  // Verify path starts with user's id (no escape)
+  const userPrefix = `${req.userId}/`;
+  if (!path.startsWith(userPrefix)) {
+    return res.status(403).json({ ok: false, error: 'Forbidden path' });
+  }
+
+  const { error } = await supabase.storage.from(SHOT_BUCKET).remove([path]);
+  if (error) {
+    console.error('[upload-delete]', error.message);
+    return res.status(500).json({ ok: false, error: 'Delete failed' });
+  }
+  res.json({ ok: true });
+});
 
 // ── Exchange (credentials stored encrypted in Supabase) ──────────────────────
 function mkEx(id, k, s) {
