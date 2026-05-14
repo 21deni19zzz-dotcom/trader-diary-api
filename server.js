@@ -255,6 +255,100 @@ app.post('/api/auth/verify', wrap(async (req, res) => {
   });
 }));
 
+// ── Auth: Sprint 9.5 (refresh + bot-driven extend) ────────────────────────────
+const INTER_SERVICE_SECRET = process.env.INTER_SERVICE_SECRET || '';
+const REFRESH_GRACE_DAYS   = parseInt(process.env.REFRESH_GRACE_DAYS || '7', 10);
+
+// POST /api/auth/refresh
+// Rotates an auth_token for an owner who still has an active subscription.
+// Accepts the old token even if revoked or recently expired, provided it falls
+// within the REFRESH_GRACE_DAYS window after expires_at.
+app.post('/api/auth/refresh', wrap(async (req, res) => {
+  const { token } = req.body || {};
+  if (!token || typeof token !== 'string') return res.status(400).json({ ok: false, error: 'token required' });
+
+  const { data: tok, error: tokErr } = await supabase.from('auth_tokens')
+    .select('telegram_user_id, expires_at')
+    .eq('token', token).maybeSingle();
+  if (tokErr) throw new Error(`auth_tokens lookup: ${tokErr.message}`);
+  if (!tok) return res.status(401).json({ ok: false, error: 'Token not found' });
+
+  const ageMs = Date.now() - new Date(tok.expires_at).getTime();
+  if (ageMs > REFRESH_GRACE_DAYS * 86400000) {
+    return res.status(401).json({ ok: false, error: 'Token outside refresh window' });
+  }
+
+  const { data: sub } = await supabase.from('subscriptions')
+    .select('expires_at').eq('telegram_user_id', tok.telegram_user_id)
+    .in('status', ['active', 'trial']).gt('expires_at', new Date().toISOString())
+    .order('expires_at', { ascending: false }).limit(1).maybeSingle();
+  if (!sub) return res.status(403).json({ ok: false, error: 'No active subscription' });
+
+  await supabase.from('auth_tokens').update({ revoked: true })
+    .eq('telegram_user_id', tok.telegram_user_id).eq('revoked', false);
+  const { data: fresh, error: insErr } = await supabase.from('auth_tokens').insert({
+    telegram_user_id: tok.telegram_user_id, expires_at: sub.expires_at,
+  }).select('token, expires_at').single();
+  if (insErr) throw new Error(`auth_tokens insert: ${insErr.message}`);
+
+  res.json({ ok: true, token: fresh.token, expires_at: fresh.expires_at });
+}));
+
+// POST /api/auth/extend-from-bot
+// Bot-driven token issuance. Authorised via X-Inter-Service-Secret header
+// (timingSafeEqual). Idempotent on body.idempotency_key — telegram_events
+// has a UNIQUE constraint on idempotency_key, so a replay returns the cached
+// token from metadata.
+app.post('/api/auth/extend-from-bot', wrap(async (req, res) => {
+  if (!INTER_SERVICE_SECRET) {
+    return res.status(503).json({ ok: false, error: 'INTER_SERVICE_SECRET not configured' });
+  }
+  const provided = String(req.headers['x-inter-service-secret'] || '');
+  const expected = Buffer.from(INTER_SERVICE_SECRET);
+  const got      = Buffer.from(provided);
+  if (expected.length !== got.length || !crypto.timingSafeEqual(expected, got)) {
+    return res.status(401).json({ ok: false, error: 'Invalid inter-service secret' });
+  }
+
+  const tg_id           = parseInt(req.body?.telegram_user_id, 10);
+  const idempotency_key = typeof req.body?.idempotency_key === 'string' ? req.body.idempotency_key.trim() : '';
+  if (!tg_id || tg_id < 1)  return res.status(400).json({ ok: false, error: 'telegram_user_id required' });
+  if (!idempotency_key)     return res.status(400).json({ ok: false, error: 'idempotency_key required' });
+
+  // Replay: same idempotency_key returns the previously-issued token.
+  const { data: prior } = await supabase.from('telegram_events')
+    .select('metadata').eq('idempotency_key', idempotency_key).maybeSingle();
+  if (prior?.metadata?.token) {
+    return res.json({ ok: true, token: prior.metadata.token, expires_at: prior.metadata.expires_at, replay: true });
+  }
+
+  const { data: sub } = await supabase.from('subscriptions')
+    .select('id, expires_at').eq('telegram_user_id', tg_id)
+    .in('status', ['active', 'trial']).gt('expires_at', new Date().toISOString())
+    .order('expires_at', { ascending: false }).limit(1).maybeSingle();
+  if (!sub) return res.status(404).json({ ok: false, error: 'No active subscription for this telegram_user_id' });
+
+  await supabase.from('auth_tokens').update({ revoked: true })
+    .eq('telegram_user_id', tg_id).eq('revoked', false);
+  const { data: fresh, error: insErr } = await supabase.from('auth_tokens').insert({
+    telegram_user_id: tg_id, expires_at: sub.expires_at,
+  }).select('token, expires_at').single();
+  if (insErr) throw new Error(`auth_tokens insert: ${insErr.message}`);
+
+  const { error: evErr } = await supabase.from('telegram_events').insert({
+    event_type: 'auth_extend',
+    telegram_user_id: tg_id,
+    idempotency_key,
+    related_subscription_id: sub.id,
+    metadata: { source: 'bot', token: fresh.token, expires_at: fresh.expires_at },
+  });
+  if (evErr && !evErr.message?.includes('duplicate')) {
+    console.error('[extend-from-bot] telegram_events insert:', evErr.message);
+  }
+
+  res.json({ ok: true, token: fresh.token, expires_at: fresh.expires_at });
+}));
+
 // ── Webhook ───────────────────────────────────────────────────────────────────
 app.post('/api/webhook/telegram', wrap(async (req, res) => {
   const upd = req.body;
