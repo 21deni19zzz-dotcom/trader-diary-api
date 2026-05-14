@@ -312,8 +312,8 @@ app.post('/api/auth/extend-from-bot', wrap(async (req, res) => {
 
   const tg_id           = parseInt(req.body?.telegram_user_id, 10);
   const idempotency_key = typeof req.body?.idempotency_key === 'string' ? req.body.idempotency_key.trim() : '';
-  if (!tg_id || tg_id < 1)  return res.status(400).json({ ok: false, error: 'telegram_user_id required' });
-  if (!idempotency_key)     return res.status(400).json({ ok: false, error: 'idempotency_key required' });
+  if (!tg_id || tg_id < 1)                                return res.status(400).json({ ok: false, error: 'telegram_user_id required' });
+  if (!idempotency_key || idempotency_key.length > 256)   return res.status(400).json({ ok: false, error: 'idempotency_key required (1..256 chars)' });
 
   // Replay: same idempotency_key returns the previously-issued token.
   const { data: prior } = await supabase.from('telegram_events')
@@ -347,6 +347,36 @@ app.post('/api/auth/extend-from-bot', wrap(async (req, res) => {
   }
 
   res.json({ ok: true, token: fresh.token, expires_at: fresh.expires_at });
+}));
+
+// POST /api/admin/notify-user
+// One-shot outbound push from the bot to a specific telegram_user_id.
+// Authorised by X-Inter-Service-Secret. Used for ops hot-fixes (e.g. send
+// a fresh login link to a customer whose token was revoked). The bot must
+// have spoken to the user previously (Telegram restriction).
+app.post('/api/admin/notify-user', wrap(async (req, res) => {
+  if (!INTER_SERVICE_SECRET) {
+    return res.status(503).json({ ok: false, error: 'INTER_SERVICE_SECRET not configured' });
+  }
+  const provided = String(req.headers['x-inter-service-secret'] || '');
+  const expected = Buffer.from(INTER_SERVICE_SECRET);
+  const got      = Buffer.from(provided);
+  if (expected.length !== got.length || !crypto.timingSafeEqual(expected, got)) {
+    return res.status(401).json({ ok: false, error: 'Invalid inter-service secret' });
+  }
+  if (!BOT_TOKEN) {
+    return res.status(503).json({ ok: false, error: 'TELEGRAM_BOT_TOKEN not configured' });
+  }
+  const tg_id = parseInt(req.body?.telegram_user_id, 10);
+  const text  = typeof req.body?.text === 'string' ? req.body.text : '';
+  const url   = typeof req.body?.url  === 'string' ? req.body.url  : null;
+  if (!tg_id || tg_id < 1)      return res.status(400).json({ ok: false, error: 'telegram_user_id required' });
+  if (text.length < 1 || text.length > 4000) return res.status(400).json({ ok: false, error: 'text required (1..4000 chars)' });
+  if (url && !/^https:\/\//i.test(url)) return res.status(400).json({ ok: false, error: 'url must be https' });
+
+  const extra = url ? { reply_markup: { inline_keyboard: [[{ text: '🎫 Открыть PTJ', url }]] } } : {};
+  await tgSend(tg_id, text, extra);
+  res.json({ ok: true });
 }));
 
 // ── Webhook ───────────────────────────────────────────────────────────────────
@@ -395,9 +425,57 @@ app.post('/api/webhook/telegram', wrap(async (req, res) => {
     } catch (e) { console.error('Webhook error:', e.message); }
     return;
   }
+  // Sprint 9.5: /access, /login, or "🎫 Мои доступы" — issue fresh login link
+  // for a user with an active subscription. Replaces the manual purchase-link
+  // recovery path when a token has been revoked by the daily expiry cron.
+  const accessText = upd.message?.text || '';
+  const isAccessRequest = (
+    accessText.startsWith('/access') ||
+    accessText.startsWith('/login')  ||
+    accessText === '🎫 Мои доступы'
+  );
+  if (isAccessRequest && upd.message?.from) {
+    const tg = upd.message.from;
+    try {
+      const { data: sub } = await supabase.from('subscriptions')
+        .select('id, expires_at').eq('telegram_user_id', tg.id)
+        .in('status', ['active', 'trial']).gt('expires_at', new Date().toISOString())
+        .order('expires_at', { ascending: false }).limit(1).maybeSingle();
+      if (!sub) {
+        await tgSend(tg.id, `❌ <b>Активной подписки нет</b>\n\nЕсли подписка была — могла истечь.\n🛍 Купить или продлить: @ParadoxxShop_bot`);
+        return;
+      }
+      await supabase.from('auth_tokens').update({ revoked: true })
+        .eq('telegram_user_id', tg.id).eq('revoked', false);
+      const { data: tok, error: tokErr } = await supabase.from('auth_tokens').insert({
+        telegram_user_id: tg.id, expires_at: sub.expires_at,
+      }).select('token, expires_at').single();
+      if (tokErr) throw new Error(`auth_tokens insert: ${tokErr.message}`);
+
+      await supabase.from('telegram_events').insert({
+        event_type: 'auth_extend', telegram_user_id: tg.id,
+        idempotency_key: `access-${tg.id}-${Date.now()}`,
+        related_subscription_id: sub.id,
+        metadata: { source: 'bot_command', token: tok.token, expires_at: tok.expires_at },
+      });
+
+      const link = `${FRONTEND}?token=${tok.token}`;
+      const exp  = new Date(sub.expires_at).toLocaleDateString('ru-RU');
+      await tgSend(tg.id,
+        `🎫 <b>Доступ обновлён</b>\n\n📅 Подписка до: <b>${exp}</b>\n\n🔗 <b>Открыть PTJ:</b>\n${link}\n\n💡 Старый токен теперь недействителен.`,
+        { reply_markup: { inline_keyboard: [[{ text: '🎫 Открыть PTJ', url: link }]] } });
+    } catch (e) {
+      console.error('[/access]', e.message);
+      await tgSend(tg.id, `⚠️ Не удалось обновить доступ. Попробуй через минуту или напиши в поддержку.`);
+    }
+    return;
+  }
+
   if (upd.message?.text?.startsWith('/start')) {
     const tg = upd.message.from;
-    await tgSend(tg.id, `👋 <b>Привет, ${tg.first_name}!</b>\n\n📊 <b>Trader Diary</b> — профессиональный торговый журнал.\n\n• Binance / Bybit / BingX\n• P&L с нашими формулами\n• Аналитика + equity curve\n\n🛍 Купить: @ParadoxxShop_bot`);
+    await tgSend(tg.id,
+      `👋 <b>Привет, ${tg.first_name}!</b>\n\n📊 <b>Trader Diary</b> — профессиональный торговый журнал.\n\n• Binance / Bybit / BingX\n• P&L с нашими формулами\n• Аналитика + equity curve\n\n🛍 Купить: @ParadoxxShop_bot\n🎫 Уже купил? Нажми «Мои доступы» ниже или отправь /access.`,
+      { reply_markup: { keyboard: [[{ text: '🎫 Мои доступы' }]], resize_keyboard: true } });
   }
 }));
 
