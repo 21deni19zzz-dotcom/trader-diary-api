@@ -257,26 +257,23 @@ app.post('/api/auth/verify', wrap(async (req, res) => {
 
 // ── Auth: Sprint 9.5 (refresh + bot-driven extend) ────────────────────────────
 const INTER_SERVICE_SECRET = process.env.INTER_SERVICE_SECRET || '';
-const REFRESH_GRACE_DAYS   = parseInt(process.env.REFRESH_GRACE_DAYS || '7', 10);
 
 // POST /api/auth/refresh
 // Rotates an auth_token for an owner who still has an active subscription.
-// Accepts the old token even if revoked or recently expired, provided it falls
-// within the REFRESH_GRACE_DAYS window after expires_at.
+// Accepts an old token only while it is still non-revoked. Once the daily
+// cron has revoked it (server.js:597, runs 10:00), the owner must recover
+// via the bot's /access command — which trusts Telegram's signed identity.
+// The two paths together prevent a previously-leaked token (e.g. from logs
+// or a metadata cache) from being silently rotated into a live one.
 app.post('/api/auth/refresh', wrap(async (req, res) => {
   const { token } = req.body || {};
   if (!token || typeof token !== 'string') return res.status(400).json({ ok: false, error: 'token required' });
 
   const { data: tok, error: tokErr } = await supabase.from('auth_tokens')
-    .select('telegram_user_id, expires_at')
-    .eq('token', token).maybeSingle();
+    .select('telegram_user_id')
+    .eq('token', token).eq('revoked', false).maybeSingle();
   if (tokErr) throw new Error(`auth_tokens lookup: ${tokErr.message}`);
-  if (!tok) return res.status(401).json({ ok: false, error: 'Token not found' });
-
-  const ageMs = Date.now() - new Date(tok.expires_at).getTime();
-  if (ageMs > REFRESH_GRACE_DAYS * 86400000) {
-    return res.status(401).json({ ok: false, error: 'Token outside refresh window' });
-  }
+  if (!tok) return res.status(401).json({ ok: false, error: 'Token not found or revoked' });
 
   const { data: sub } = await supabase.from('subscriptions')
     .select('expires_at').eq('telegram_user_id', tok.telegram_user_id)
@@ -315,11 +312,19 @@ app.post('/api/auth/extend-from-bot', wrap(async (req, res) => {
   if (!tg_id || tg_id < 1)                                return res.status(400).json({ ok: false, error: 'telegram_user_id required' });
   if (!idempotency_key || idempotency_key.length > 256)   return res.status(400).json({ ok: false, error: 'idempotency_key required (1..256 chars)' });
 
-  // Replay: same idempotency_key returns the previously-issued token.
+  // Replay: same idempotency_key returns the previously-issued token only if
+  // that token is still live. If the cached row points at a token that has
+  // since been revoked (e.g. user renewed and rotated), fall through and
+  // issue a fresh one — then upsert the event so the cache catches up.
   const { data: prior } = await supabase.from('telegram_events')
     .select('metadata').eq('idempotency_key', idempotency_key).maybeSingle();
   if (prior?.metadata?.token) {
-    return res.json({ ok: true, token: prior.metadata.token, expires_at: prior.metadata.expires_at, replay: true });
+    const { data: live } = await supabase.from('auth_tokens')
+      .select('token').eq('token', prior.metadata.token)
+      .eq('revoked', false).gt('expires_at', new Date().toISOString()).maybeSingle();
+    if (live) {
+      return res.json({ ok: true, token: prior.metadata.token, expires_at: prior.metadata.expires_at, replay: true });
+    }
   }
 
   const { data: sub } = await supabase.from('subscriptions')
@@ -335,16 +340,14 @@ app.post('/api/auth/extend-from-bot', wrap(async (req, res) => {
   }).select('token, expires_at').single();
   if (insErr) throw new Error(`auth_tokens insert: ${insErr.message}`);
 
-  const { error: evErr } = await supabase.from('telegram_events').insert({
+  const { error: evErr } = await supabase.from('telegram_events').upsert({
     event_type: 'auth_extend',
     telegram_user_id: tg_id,
     idempotency_key,
     related_subscription_id: sub.id,
     metadata: { source: 'bot', token: fresh.token, expires_at: fresh.expires_at },
-  });
-  if (evErr && !evErr.message?.includes('duplicate')) {
-    console.error('[extend-from-bot] telegram_events insert:', evErr.message);
-  }
+  }, { onConflict: 'idempotency_key' });
+  if (evErr) console.error('[extend-from-bot] telegram_events upsert:', evErr.message);
 
   res.json({ ok: true, token: fresh.token, expires_at: fresh.expires_at });
 }));
@@ -374,8 +377,12 @@ app.post('/api/admin/notify-user', wrap(async (req, res) => {
   if (text.length < 1 || text.length > 4000) return res.status(400).json({ ok: false, error: 'text required (1..4000 chars)' });
   if (url && !/^https:\/\//i.test(url)) return res.status(400).json({ ok: false, error: 'url must be https' });
 
+  // Strip <a> tags from the message body so a leaked INTER_SERVICE_SECRET
+  // can't be turned into a phishing-link delivery channel via the verified
+  // bot. Legitimate clickable navigation goes through the `url` button.
+  const safeText = text.replace(/<\s*a\b[^>]*>/gi, '').replace(/<\s*\/\s*a\s*>/gi, '');
   const extra = url ? { reply_markup: { inline_keyboard: [[{ text: '🎫 Открыть PTJ', url }]] } } : {};
-  await tgSend(tg_id, text, extra);
+  await tgSend(tg_id, safeText, extra);
   res.json({ ok: true });
 }));
 
@@ -452,12 +459,15 @@ app.post('/api/webhook/telegram', wrap(async (req, res) => {
       }).select('token, expires_at').single();
       if (tokErr) throw new Error(`auth_tokens insert: ${tokErr.message}`);
 
-      await supabase.from('telegram_events').insert({
+      // Key on the Telegram update_id so a webhook retry (5xx / network)
+      // dedupes against the UNIQUE constraint on telegram_events.idempotency_key.
+      const idemp = `access-${upd.update_id || `${tg.id}-${Date.now()}`}`;
+      await supabase.from('telegram_events').upsert({
         event_type: 'auth_extend', telegram_user_id: tg.id,
-        idempotency_key: `access-${tg.id}-${Date.now()}`,
+        idempotency_key: idemp,
         related_subscription_id: sub.id,
         metadata: { source: 'bot_command', token: tok.token, expires_at: tok.expires_at },
-      });
+      }, { onConflict: 'idempotency_key' });
 
       const link = `${FRONTEND}?token=${tok.token}`;
       const exp  = new Date(sub.expires_at).toLocaleDateString('ru-RU');
