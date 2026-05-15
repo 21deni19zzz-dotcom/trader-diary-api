@@ -24,6 +24,15 @@ const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TG_API    = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const FRONTEND  = process.env.FRONTEND_URL || 'https://trader-diary-rust.vercel.app';
 const ENC_KEY   = process.env.ENCRYPTION_KEY || crypto.randomBytes(32).toString('hex');
+// Telegram webhook signature: when Bot API setWebhook is configured with
+// secret_token=<X>, every webhook delivery carries header
+// X-Telegram-Bot-Api-Secret-Token: <X>. We compare in constant time. If the
+// env var is unset, verification is skipped (compat path) — operator sees
+// the warning below and is expected to set env + setWebhook in lockstep.
+const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || '';
+if (!TELEGRAM_WEBHOOK_SECRET) {
+  console.warn('[boot] TELEGRAM_WEBHOOK_SECRET not set — webhook signature verification DISABLED');
+}
 
 // ── Security middleware ───────────────────────────────────────────────────────
 const ALLOWED_ORIGINS = [
@@ -415,6 +424,18 @@ app.post('/api/admin/notify-user', wrap(async (req, res) => {
 
 // ── Webhook ───────────────────────────────────────────────────────────────────
 app.post('/api/webhook/telegram', wrap(async (req, res) => {
+  // SH-2/SH-3: verify Telegram's signed webhook secret. Reject unsigned
+  // deliveries when the secret is configured; otherwise log-only (boot warning
+  // already printed). Covers all webhook subtypes — pre_checkout_query,
+  // successful_payment, /access /login /🎫 — in a single gate.
+  if (TELEGRAM_WEBHOOK_SECRET) {
+    const provided = String(req.headers['x-telegram-bot-api-secret-token'] || '');
+    const a = Buffer.from(provided);
+    const b = Buffer.from(TELEGRAM_WEBHOOK_SECRET);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return res.status(401).json({ ok: false, error: 'Invalid webhook secret' });
+    }
+  }
   const upd = req.body;
   res.json({ ok: true });
   if (upd.pre_checkout_query) {
