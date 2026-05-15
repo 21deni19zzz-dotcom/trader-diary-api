@@ -23,7 +23,20 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSessi
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TG_API    = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const FRONTEND  = process.env.FRONTEND_URL || 'https://trader-diary-rust.vercel.app';
-const ENC_KEY   = process.env.ENCRYPTION_KEY || crypto.randomBytes(32).toString('hex');
+// ENCRYPTION_KEY decrypts AES-256 rows in exchange_connections.api_key_enc/secret_enc.
+// In production we refuse to boot without it — an ephemeral random key would
+// silently make all existing encrypted rows un-decryptable on the next restart.
+// In dev we still allow ephemeral (warns loudly) so local smoke runs don't need
+// the secret stashed.
+const ENCRYPTION_KEY_ENV = process.env.ENCRYPTION_KEY;
+if (!ENCRYPTION_KEY_ENV) {
+  if (process.env.NODE_ENV === 'production') {
+    console.error('FATAL: ENCRYPTION_KEY env var required in production (AES key for exchange_connections rows)');
+    process.exit(1);
+  }
+  console.warn('[boot] ENCRYPTION_KEY not set — using ephemeral random key (dev only; encrypted DB rows will NOT survive restart)');
+}
+const ENC_KEY   = ENCRYPTION_KEY_ENV || crypto.randomBytes(32).toString('hex');
 // Telegram webhook signature: when Bot API setWebhook is configured with
 // secret_token=<X>, every webhook delivery carries header
 // X-Telegram-Bot-Api-Secret-Token: <X>. We compare in constant time. If the
