@@ -44,7 +44,21 @@ const ENC_KEY   = ENCRYPTION_KEY_ENV || crypto.randomBytes(32).toString('hex');
 // the warning below and is expected to set env + setWebhook in lockstep.
 const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || '';
 if (!TELEGRAM_WEBHOOK_SECRET) {
-  console.warn('[boot] TELEGRAM_WEBHOOK_SECRET not set — webhook signature verification DISABLED');
+  // In production this is a real risk surface: without the signed header,
+  // anyone who knows the public webhook URL can forge successful_payment,
+  // pre_checkout_query, or /access messages. We still boot (so the
+  // operator can stage the env change first) but log loudly enough that
+  // the gap can't go unnoticed in a quiet monitoring setup.
+  const banner = '!! TELEGRAM_WEBHOOK_SECRET NOT SET — /api/webhook/telegram accepts UNSIGNED requests !!';
+  if (process.env.NODE_ENV === 'production') {
+    console.error('============================================================');
+    console.error(banner);
+    console.error('Set TELEGRAM_WEBHOOK_SECRET in Railway env AND call the Bot');
+    console.error('API setWebhook with the same secret_token in lockstep.');
+    console.error('============================================================');
+  } else {
+    console.warn('[boot]', banner);
+  }
 }
 
 // ── Security middleware ───────────────────────────────────────────────────────
@@ -357,8 +371,15 @@ app.post('/api/auth/extend-from-bot', wrap(async (req, res) => {
   // since been revoked (e.g. user renewed and rotated), fall through and
   // issue a fresh one — then upsert the event so the cache catches up.
   const { data: prior } = await supabase.from('telegram_events')
-    .select('metadata').eq('idempotency_key', idempotency_key).maybeSingle();
-  if (prior?.metadata?.token_sha256) {
+    .select('telegram_user_id, metadata')
+    .eq('idempotency_key', idempotency_key).maybeSingle();
+  // Replay is only honoured when the cached row was originally created for
+  // THIS user. Without this, a caller who has the inter-service secret could
+  // submit someone else's idempotency_key and — if they happened to own a
+  // token whose digest matches the cached one — bait the lookup into
+  // returning the victim's plaintext. The tg_id match keeps the auth_tokens
+  // lookup pinned to the original owner.
+  if (prior?.metadata?.token_sha256 && prior.telegram_user_id === tg_id) {
     // Look up the user's current live token, then compare its digest to the
     // one we cached at first-issue. If they match, this is a true replay and
     // we return the same plaintext (from auth_tokens, the source of truth).
@@ -703,6 +724,15 @@ app.post('/api/uploads/screenshot', requireAuth, (req, res) => {
 app.delete('/api/uploads/screenshot', requireAuth, express.json(), async (req, res) => {
   const path = String(req.body.path || '');
   if (!path) return res.status(400).json({ ok: false, error: 'path required' });
+
+  // Defence in depth: even though Supabase Storage normalises traversal,
+  // refuse any path containing the dot-dot escape or double slashes so a
+  // single dependency bug can't grant cross-user deletion. Also bound the
+  // length and the character set to what our writer produces (uuid/tradeId
+  // segments + extension).
+  if (path.length > 256 || path.includes('..') || path.includes('//') || path.includes('\\') || /[^a-zA-Z0-9._/-]/.test(path)) {
+    return res.status(400).json({ ok: false, error: 'Invalid path' });
+  }
 
   // Verify path starts with user's id (no escape)
   const userPrefix = `${req.userId}/`;
