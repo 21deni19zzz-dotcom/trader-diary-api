@@ -815,13 +815,71 @@ app.post('/api/exchange/positions', requireAuth, wrap(async (req, res) => {
   const { exchange } = req.body;
   valEx(exchange);
   const ex = await getStoredEx(req.userId, exchange);
-  const pos = (await ex.fetchPositions()).filter(p => +(p.contracts || 0) > 0).map(p => ({
-    symbol: p.symbol, side: p.side, size: +p.contracts, entryPrice: +p.entryPrice,
-    markPrice: +p.markPrice, unrealizedPnl: +p.unrealizedPnl, leverage: p.leverage,
-    pnlPct: p.entryPrice && p.markPrice ? +((p.markPrice - p.entryPrice) / p.entryPrice * 100 * (p.side === 'short' ? -1 : 1)).toFixed(3) : null,
-    exchange,
-  }));
-  res.json({ ok: true, count: pos.length, positions: pos });
+  try {
+    const pos = (await ex.fetchPositions()).filter(p => +(p.contracts || 0) > 0).map(p => ({
+      symbol: p.symbol, side: p.side, size: +p.contracts, entryPrice: +p.entryPrice,
+      markPrice: +p.markPrice, unrealizedPnl: +p.unrealizedPnl, leverage: p.leverage,
+      pnlPct: p.entryPrice && p.markPrice ? +((p.markPrice - p.entryPrice) / p.entryPrice * 100 * (p.side === 'short' ? -1 : 1)).toFixed(3) : null,
+      exchange,
+    }));
+    res.json({ ok: true, count: pos.length, positions: pos });
+  } finally {
+    try { await ex.close?.(); } catch { /* close best-effort */ }
+  }
+}));
+
+// Sprint 9A · Live monitor — single-call snapshot of open positions across ALL
+// of the user's connected exchanges. The existing POST /api/exchange/positions
+// is per-exchange (frontend would have to N+1 it), this fans out server-side,
+// fails partially (one bad exchange doesn't kill the whole response), and
+// closes each CCXT instance to avoid the FD-leak audited as a P2.
+app.get('/api/positions/live', requireAuth, wrap(async (req, res) => {
+  const { data: conns, error: cErr } = await supabase.from('exchange_connections')
+    .select('exchange, api_key_enc, secret_enc')
+    .eq('telegram_user_id', req.userId);
+  if (cErr) throw new Error(`exchange_connections lookup: ${cErr.message}`);
+  if (!conns || conns.length === 0) {
+    return res.json({ ok: true, positions: [], exchanges: 0, errors: [] });
+  }
+  const all = [];
+  const errors = [];
+  for (const conn of conns) {
+    let ex = null;
+    try {
+      ex = mkEx(conn.exchange, decrypt(conn.api_key_enc), decrypt(conn.secret_enc));
+      if (!ex) { errors.push({ exchange: conn.exchange, message: 'unsupported' }); continue; }
+      const raw = await ex.fetchPositions();
+      for (const p of raw) {
+        const size = +(p.contracts || 0);
+        if (!Number.isFinite(size) || Math.abs(size) === 0) continue;
+        const entry = p.entryPrice != null ? +p.entryPrice : null;
+        const mark  = p.markPrice  != null ? +p.markPrice  : null;
+        const pnlPct = entry && mark
+          ? +((mark - entry) / entry * 100 * (p.side === 'short' ? -1 : 1)).toFixed(3)
+          : null;
+        all.push({
+          exchange: conn.exchange,
+          symbol: p.symbol,
+          side: p.side,
+          size,
+          entryPrice: entry,
+          markPrice: mark,
+          unrealizedPnl: p.unrealizedPnl != null ? +p.unrealizedPnl : 0,
+          pnlPct,
+          leverage: p.leverage != null ? +p.leverage : null,
+          ts: Date.now(),
+        });
+      }
+    } catch (e) {
+      console.error(`[live] ${conn.exchange}:`, e.message);
+      errors.push({ exchange: conn.exchange, message: String(e.message || e).slice(0, 200) });
+    } finally {
+      try { await ex?.close?.(); } catch { /* best-effort */ }
+    }
+  }
+  // Sort by absolute PnL desc — biggest movers first
+  all.sort((a, b) => Math.abs(b.unrealizedPnl) - Math.abs(a.unrealizedPnl));
+  res.json({ ok: true, positions: all, exchanges: conns.length, errors });
 }));
 
 // Legacy redirect
