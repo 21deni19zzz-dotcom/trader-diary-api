@@ -432,8 +432,11 @@ app.post('/api/webhook/telegram', wrap(async (req, res) => {
       const { data: prod } = await supabase.from('products').select('*').eq('slug', slug).single();
       if (!prod) return;
       const expiresAt = new Date(Date.now() + prod.duration_days * 86400000).toISOString();
+      // product_id stores the product UUID (products.id), not the slug.
+      // Existing customer rows already use UUIDs; this normalises new inserts
+      // so admin queries and joins on subscriptions don't need OR-branches.
       const { data: sub } = await supabase.from('subscriptions').insert({
-        telegram_user_id: tg.id, product_id: prod.slug, status: 'active',
+        telegram_user_id: tg.id, product_id: prod.id, status: 'active',
         expires_at: expiresAt, payment_method: 'stars', amount_paid: pay.total_amount
       }).select().single();
 
@@ -445,7 +448,7 @@ app.post('/api/webhook/telegram', wrap(async (req, res) => {
         telegram_user_id: tg.id, expires_at: expiresAt
       }).select('token').single();
       await supabase.from('telegram_events').insert({
-        event_type: 'payment_success', telegram_user_id: tg.id, product_id: prod.slug,
+        event_type: 'payment_success', telegram_user_id: tg.id, product_id: prod.id,
         payment_method: 'stars', payment_tx_id: pay.telegram_payment_charge_id,
         idempotency_key: pay.telegram_payment_charge_id, related_subscription_id: sub?.id,
         metadata: { amount: pay.total_amount, currency: pay.currency }
