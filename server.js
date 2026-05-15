@@ -23,7 +23,43 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSessi
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TG_API    = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const FRONTEND  = process.env.FRONTEND_URL || 'https://trader-diary-rust.vercel.app';
-const ENC_KEY   = process.env.ENCRYPTION_KEY || crypto.randomBytes(32).toString('hex');
+// ENCRYPTION_KEY decrypts AES-256 rows in exchange_connections.api_key_enc/secret_enc.
+// In production we refuse to boot without it — an ephemeral random key would
+// silently make all existing encrypted rows un-decryptable on the next restart.
+// In dev we still allow ephemeral (warns loudly) so local smoke runs don't need
+// the secret stashed.
+const ENCRYPTION_KEY_ENV = process.env.ENCRYPTION_KEY;
+if (!ENCRYPTION_KEY_ENV) {
+  if (process.env.NODE_ENV === 'production') {
+    console.error('FATAL: ENCRYPTION_KEY env var required in production (AES key for exchange_connections rows)');
+    process.exit(1);
+  }
+  console.warn('[boot] ENCRYPTION_KEY not set — using ephemeral random key (dev only; encrypted DB rows will NOT survive restart)');
+}
+const ENC_KEY   = ENCRYPTION_KEY_ENV || crypto.randomBytes(32).toString('hex');
+// Telegram webhook signature: when Bot API setWebhook is configured with
+// secret_token=<X>, every webhook delivery carries header
+// X-Telegram-Bot-Api-Secret-Token: <X>. We compare in constant time. If the
+// env var is unset, verification is skipped (compat path) — operator sees
+// the warning below and is expected to set env + setWebhook in lockstep.
+const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || '';
+if (!TELEGRAM_WEBHOOK_SECRET) {
+  // In production this is a real risk surface: without the signed header,
+  // anyone who knows the public webhook URL can forge successful_payment,
+  // pre_checkout_query, or /access messages. We still boot (so the
+  // operator can stage the env change first) but log loudly enough that
+  // the gap can't go unnoticed in a quiet monitoring setup.
+  const banner = '!! TELEGRAM_WEBHOOK_SECRET NOT SET — /api/webhook/telegram accepts UNSIGNED requests !!';
+  if (process.env.NODE_ENV === 'production') {
+    console.error('============================================================');
+    console.error(banner);
+    console.error('Set TELEGRAM_WEBHOOK_SECRET in Railway env AND call the Bot');
+    console.error('API setWebhook with the same secret_token in lockstep.');
+    console.error('============================================================');
+  } else {
+    console.warn('[boot]', banner);
+  }
+}
 
 // ── Security middleware ───────────────────────────────────────────────────────
 const ALLOWED_ORIGINS = [
@@ -100,6 +136,12 @@ function decrypt(data) {
   const d = crypto.createDecipheriv('aes-256-cbc', key, Buffer.from(ivH, 'hex'));
   return d.update(enc, 'hex', 'utf8') + d.final('utf8');
 }
+
+// SHA256 digest used as opaque fingerprint for auth tokens stored in
+// telegram_events.metadata. The plaintext token lives only in auth_tokens
+// (the source of truth); metadata keeps just the digest so a read-leak of
+// telegram_events can't grant access. Replay-protection compares digests.
+function sha256(s) { return crypto.createHash('sha256').update(String(s)).digest('hex'); }
 
 // ── Validation ────────────────────────────────────────────────────────────────
 function validateFills(fills, errArr) {
@@ -288,6 +330,18 @@ app.post('/api/auth/refresh', wrap(async (req, res) => {
   }).select('token, expires_at').single();
   if (insErr) throw new Error(`auth_tokens insert: ${insErr.message}`);
 
+  // Audit trail for the silent-401 refresh path. /refresh has no natural
+  // idempotency key (frontend retries opportunistically), so we synthesise
+  // one with a timestamp — each call gets its own row. Failure to log is
+  // non-fatal: rotation already succeeded.
+  const { error: evErr } = await supabase.from('telegram_events').insert({
+    event_type: 'auth_refresh',
+    telegram_user_id: tok.telegram_user_id,
+    idempotency_key: `refresh-${tok.telegram_user_id}-${crypto.randomUUID()}`,
+    metadata: { source: 'web', token_sha256: sha256(fresh.token), expires_at: fresh.expires_at },
+  });
+  if (evErr) console.error('[refresh] telegram_events insert:', evErr.message);
+
   res.json({ ok: true, token: fresh.token, expires_at: fresh.expires_at });
 }));
 
@@ -317,13 +371,29 @@ app.post('/api/auth/extend-from-bot', wrap(async (req, res) => {
   // since been revoked (e.g. user renewed and rotated), fall through and
   // issue a fresh one — then upsert the event so the cache catches up.
   const { data: prior } = await supabase.from('telegram_events')
-    .select('metadata').eq('idempotency_key', idempotency_key).maybeSingle();
-  if (prior?.metadata?.token) {
+    .select('telegram_user_id, metadata')
+    .eq('idempotency_key', idempotency_key).maybeSingle();
+  // Replay is only honoured when the cached row was originally created for
+  // THIS user. Without this, a caller who has the inter-service secret could
+  // submit someone else's idempotency_key and — if they happened to own a
+  // token whose digest matches the cached one — bait the lookup into
+  // returning the victim's plaintext. The tg_id match keeps the auth_tokens
+  // lookup pinned to the original owner.
+  if (prior?.metadata?.token_sha256 && prior.telegram_user_id === tg_id) {
+    // Look up the user's current live token, then compare its digest to the
+    // one we cached at first-issue. If they match, this is a true replay and
+    // we return the same plaintext (from auth_tokens, the source of truth).
+    // If they don't match (token rotated/revoked since), fall through to a
+    // fresh issuance — same behaviour as before the hashing change.
     const { data: live } = await supabase.from('auth_tokens')
-      .select('token').eq('token', prior.metadata.token)
-      .eq('revoked', false).gt('expires_at', new Date().toISOString()).maybeSingle();
-    if (live) {
-      return res.json({ ok: true, token: prior.metadata.token, expires_at: prior.metadata.expires_at, replay: true });
+      .select('token, expires_at')
+      .eq('telegram_user_id', tg_id)
+      .eq('revoked', false)
+      .gt('expires_at', new Date().toISOString())
+      .order('expires_at', { ascending: false })
+      .limit(1).maybeSingle();
+    if (live && sha256(live.token) === prior.metadata.token_sha256) {
+      return res.json({ ok: true, token: live.token, expires_at: live.expires_at, replay: true });
     }
   }
 
@@ -345,7 +415,7 @@ app.post('/api/auth/extend-from-bot', wrap(async (req, res) => {
     telegram_user_id: tg_id,
     idempotency_key,
     related_subscription_id: sub.id,
-    metadata: { source: 'bot', token: fresh.token, expires_at: fresh.expires_at },
+    metadata: { source: 'bot', token_sha256: sha256(fresh.token), expires_at: fresh.expires_at },
   }, { onConflict: 'idempotency_key' });
   if (evErr) console.error('[extend-from-bot] telegram_events upsert:', evErr.message);
 
@@ -388,6 +458,18 @@ app.post('/api/admin/notify-user', wrap(async (req, res) => {
 
 // ── Webhook ───────────────────────────────────────────────────────────────────
 app.post('/api/webhook/telegram', wrap(async (req, res) => {
+  // SH-2/SH-3: verify Telegram's signed webhook secret. Reject unsigned
+  // deliveries when the secret is configured; otherwise log-only (boot warning
+  // already printed). Covers all webhook subtypes — pre_checkout_query,
+  // successful_payment, /access /login /🎫 — in a single gate.
+  if (TELEGRAM_WEBHOOK_SECRET) {
+    const provided = String(req.headers['x-telegram-bot-api-secret-token'] || '');
+    const a = Buffer.from(provided);
+    const b = Buffer.from(TELEGRAM_WEBHOOK_SECRET);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return res.status(401).json({ ok: false, error: 'Invalid webhook secret' });
+    }
+  }
   const upd = req.body;
   res.json({ ok: true });
   if (upd.pre_checkout_query) {
@@ -405,8 +487,11 @@ app.post('/api/webhook/telegram', wrap(async (req, res) => {
       const { data: prod } = await supabase.from('products').select('*').eq('slug', slug).single();
       if (!prod) return;
       const expiresAt = new Date(Date.now() + prod.duration_days * 86400000).toISOString();
+      // product_id stores the product UUID (products.id), not the slug.
+      // Existing customer rows already use UUIDs; this normalises new inserts
+      // so admin queries and joins on subscriptions don't need OR-branches.
       const { data: sub } = await supabase.from('subscriptions').insert({
-        telegram_user_id: tg.id, product_id: prod.slug, status: 'active',
+        telegram_user_id: tg.id, product_id: prod.id, status: 'active',
         expires_at: expiresAt, payment_method: 'stars', amount_paid: pay.total_amount
       }).select().single();
 
@@ -418,7 +503,7 @@ app.post('/api/webhook/telegram', wrap(async (req, res) => {
         telegram_user_id: tg.id, expires_at: expiresAt
       }).select('token').single();
       await supabase.from('telegram_events').insert({
-        event_type: 'payment_success', telegram_user_id: tg.id, product_id: prod.slug,
+        event_type: 'payment_success', telegram_user_id: tg.id, product_id: prod.id,
         payment_method: 'stars', payment_tx_id: pay.telegram_payment_charge_id,
         idempotency_key: pay.telegram_payment_charge_id, related_subscription_id: sub?.id,
         metadata: { amount: pay.total_amount, currency: pay.currency }
@@ -466,7 +551,7 @@ app.post('/api/webhook/telegram', wrap(async (req, res) => {
         event_type: 'auth_extend', telegram_user_id: tg.id,
         idempotency_key: idemp,
         related_subscription_id: sub.id,
-        metadata: { source: 'bot_command', token: tok.token, expires_at: tok.expires_at },
+        metadata: { source: 'bot_command', token_sha256: sha256(tok.token), expires_at: tok.expires_at },
       }, { onConflict: 'idempotency_key' });
 
       const link = `${FRONTEND}?token=${tok.token}`;
@@ -639,6 +724,15 @@ app.post('/api/uploads/screenshot', requireAuth, (req, res) => {
 app.delete('/api/uploads/screenshot', requireAuth, express.json(), async (req, res) => {
   const path = String(req.body.path || '');
   if (!path) return res.status(400).json({ ok: false, error: 'path required' });
+
+  // Defence in depth: even though Supabase Storage normalises traversal,
+  // refuse any path containing the dot-dot escape or double slashes so a
+  // single dependency bug can't grant cross-user deletion. Also bound the
+  // length and the character set to what our writer produces (uuid/tradeId
+  // segments + extension).
+  if (path.length > 256 || path.includes('..') || path.includes('//') || path.includes('\\') || /[^a-zA-Z0-9._/-]/.test(path)) {
+    return res.status(400).json({ ok: false, error: 'Invalid path' });
+  }
 
   // Verify path starts with user's id (no escape)
   const userPrefix = `${req.userId}/`;
