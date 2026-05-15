@@ -255,6 +255,137 @@ app.post('/api/auth/verify', wrap(async (req, res) => {
   });
 }));
 
+// ── Auth: Sprint 9.5 (refresh + bot-driven extend) ────────────────────────────
+const INTER_SERVICE_SECRET = process.env.INTER_SERVICE_SECRET || '';
+
+// POST /api/auth/refresh
+// Rotates an auth_token for an owner who still has an active subscription.
+// Accepts an old token only while it is still non-revoked. Once the daily
+// cron has revoked it (server.js:597, runs 10:00), the owner must recover
+// via the bot's /access command — which trusts Telegram's signed identity.
+// The two paths together prevent a previously-leaked token (e.g. from logs
+// or a metadata cache) from being silently rotated into a live one.
+app.post('/api/auth/refresh', wrap(async (req, res) => {
+  const { token } = req.body || {};
+  if (!token || typeof token !== 'string') return res.status(400).json({ ok: false, error: 'token required' });
+
+  const { data: tok, error: tokErr } = await supabase.from('auth_tokens')
+    .select('telegram_user_id')
+    .eq('token', token).eq('revoked', false).maybeSingle();
+  if (tokErr) throw new Error(`auth_tokens lookup: ${tokErr.message}`);
+  if (!tok) return res.status(401).json({ ok: false, error: 'Token not found or revoked' });
+
+  const { data: sub } = await supabase.from('subscriptions')
+    .select('expires_at').eq('telegram_user_id', tok.telegram_user_id)
+    .in('status', ['active', 'trial']).gt('expires_at', new Date().toISOString())
+    .order('expires_at', { ascending: false }).limit(1).maybeSingle();
+  if (!sub) return res.status(403).json({ ok: false, error: 'No active subscription' });
+
+  await supabase.from('auth_tokens').update({ revoked: true })
+    .eq('telegram_user_id', tok.telegram_user_id).eq('revoked', false);
+  const { data: fresh, error: insErr } = await supabase.from('auth_tokens').insert({
+    telegram_user_id: tok.telegram_user_id, expires_at: sub.expires_at,
+  }).select('token, expires_at').single();
+  if (insErr) throw new Error(`auth_tokens insert: ${insErr.message}`);
+
+  res.json({ ok: true, token: fresh.token, expires_at: fresh.expires_at });
+}));
+
+// POST /api/auth/extend-from-bot
+// Bot-driven token issuance. Authorised via X-Inter-Service-Secret header
+// (timingSafeEqual). Idempotent on body.idempotency_key — telegram_events
+// has a UNIQUE constraint on idempotency_key, so a replay returns the cached
+// token from metadata.
+app.post('/api/auth/extend-from-bot', wrap(async (req, res) => {
+  if (!INTER_SERVICE_SECRET) {
+    return res.status(503).json({ ok: false, error: 'INTER_SERVICE_SECRET not configured' });
+  }
+  const provided = String(req.headers['x-inter-service-secret'] || '');
+  const expected = Buffer.from(INTER_SERVICE_SECRET);
+  const got      = Buffer.from(provided);
+  if (expected.length !== got.length || !crypto.timingSafeEqual(expected, got)) {
+    return res.status(401).json({ ok: false, error: 'Invalid inter-service secret' });
+  }
+
+  const tg_id           = parseInt(req.body?.telegram_user_id, 10);
+  const idempotency_key = typeof req.body?.idempotency_key === 'string' ? req.body.idempotency_key.trim() : '';
+  if (!tg_id || tg_id < 1)                                return res.status(400).json({ ok: false, error: 'telegram_user_id required' });
+  if (!idempotency_key || idempotency_key.length > 256)   return res.status(400).json({ ok: false, error: 'idempotency_key required (1..256 chars)' });
+
+  // Replay: same idempotency_key returns the previously-issued token only if
+  // that token is still live. If the cached row points at a token that has
+  // since been revoked (e.g. user renewed and rotated), fall through and
+  // issue a fresh one — then upsert the event so the cache catches up.
+  const { data: prior } = await supabase.from('telegram_events')
+    .select('metadata').eq('idempotency_key', idempotency_key).maybeSingle();
+  if (prior?.metadata?.token) {
+    const { data: live } = await supabase.from('auth_tokens')
+      .select('token').eq('token', prior.metadata.token)
+      .eq('revoked', false).gt('expires_at', new Date().toISOString()).maybeSingle();
+    if (live) {
+      return res.json({ ok: true, token: prior.metadata.token, expires_at: prior.metadata.expires_at, replay: true });
+    }
+  }
+
+  const { data: sub } = await supabase.from('subscriptions')
+    .select('id, expires_at').eq('telegram_user_id', tg_id)
+    .in('status', ['active', 'trial']).gt('expires_at', new Date().toISOString())
+    .order('expires_at', { ascending: false }).limit(1).maybeSingle();
+  if (!sub) return res.status(404).json({ ok: false, error: 'No active subscription for this telegram_user_id' });
+
+  await supabase.from('auth_tokens').update({ revoked: true })
+    .eq('telegram_user_id', tg_id).eq('revoked', false);
+  const { data: fresh, error: insErr } = await supabase.from('auth_tokens').insert({
+    telegram_user_id: tg_id, expires_at: sub.expires_at,
+  }).select('token, expires_at').single();
+  if (insErr) throw new Error(`auth_tokens insert: ${insErr.message}`);
+
+  const { error: evErr } = await supabase.from('telegram_events').upsert({
+    event_type: 'auth_extend',
+    telegram_user_id: tg_id,
+    idempotency_key,
+    related_subscription_id: sub.id,
+    metadata: { source: 'bot', token: fresh.token, expires_at: fresh.expires_at },
+  }, { onConflict: 'idempotency_key' });
+  if (evErr) console.error('[extend-from-bot] telegram_events upsert:', evErr.message);
+
+  res.json({ ok: true, token: fresh.token, expires_at: fresh.expires_at });
+}));
+
+// POST /api/admin/notify-user
+// One-shot outbound push from the bot to a specific telegram_user_id.
+// Authorised by X-Inter-Service-Secret. Used for ops hot-fixes (e.g. send
+// a fresh login link to a customer whose token was revoked). The bot must
+// have spoken to the user previously (Telegram restriction).
+app.post('/api/admin/notify-user', wrap(async (req, res) => {
+  if (!INTER_SERVICE_SECRET) {
+    return res.status(503).json({ ok: false, error: 'INTER_SERVICE_SECRET not configured' });
+  }
+  const provided = String(req.headers['x-inter-service-secret'] || '');
+  const expected = Buffer.from(INTER_SERVICE_SECRET);
+  const got      = Buffer.from(provided);
+  if (expected.length !== got.length || !crypto.timingSafeEqual(expected, got)) {
+    return res.status(401).json({ ok: false, error: 'Invalid inter-service secret' });
+  }
+  if (!BOT_TOKEN) {
+    return res.status(503).json({ ok: false, error: 'TELEGRAM_BOT_TOKEN not configured' });
+  }
+  const tg_id = parseInt(req.body?.telegram_user_id, 10);
+  const text  = typeof req.body?.text === 'string' ? req.body.text : '';
+  const url   = typeof req.body?.url  === 'string' ? req.body.url  : null;
+  if (!tg_id || tg_id < 1)      return res.status(400).json({ ok: false, error: 'telegram_user_id required' });
+  if (text.length < 1 || text.length > 4000) return res.status(400).json({ ok: false, error: 'text required (1..4000 chars)' });
+  if (url && !/^https:\/\//i.test(url)) return res.status(400).json({ ok: false, error: 'url must be https' });
+
+  // Strip <a> tags from the message body so a leaked INTER_SERVICE_SECRET
+  // can't be turned into a phishing-link delivery channel via the verified
+  // bot. Legitimate clickable navigation goes through the `url` button.
+  const safeText = text.replace(/<\s*a\b[^>]*>/gi, '').replace(/<\s*\/\s*a\s*>/gi, '');
+  const extra = url ? { reply_markup: { inline_keyboard: [[{ text: '🎫 Открыть PTJ', url }]] } } : {};
+  await tgSend(tg_id, safeText, extra);
+  res.json({ ok: true });
+}));
+
 // ── Webhook ───────────────────────────────────────────────────────────────────
 app.post('/api/webhook/telegram', wrap(async (req, res) => {
   const upd = req.body;
@@ -301,9 +432,60 @@ app.post('/api/webhook/telegram', wrap(async (req, res) => {
     } catch (e) { console.error('Webhook error:', e.message); }
     return;
   }
+  // Sprint 9.5: /access, /login, or "🎫 Мои доступы" — issue fresh login link
+  // for a user with an active subscription. Replaces the manual purchase-link
+  // recovery path when a token has been revoked by the daily expiry cron.
+  const accessText = upd.message?.text || '';
+  const isAccessRequest = (
+    accessText.startsWith('/access') ||
+    accessText.startsWith('/login')  ||
+    accessText === '🎫 Мои доступы'
+  );
+  if (isAccessRequest && upd.message?.from) {
+    const tg = upd.message.from;
+    try {
+      const { data: sub } = await supabase.from('subscriptions')
+        .select('id, expires_at').eq('telegram_user_id', tg.id)
+        .in('status', ['active', 'trial']).gt('expires_at', new Date().toISOString())
+        .order('expires_at', { ascending: false }).limit(1).maybeSingle();
+      if (!sub) {
+        await tgSend(tg.id, `❌ <b>Активной подписки нет</b>\n\nЕсли подписка была — могла истечь.\n🛍 Купить или продлить: @ParadoxxShop_bot`);
+        return;
+      }
+      await supabase.from('auth_tokens').update({ revoked: true })
+        .eq('telegram_user_id', tg.id).eq('revoked', false);
+      const { data: tok, error: tokErr } = await supabase.from('auth_tokens').insert({
+        telegram_user_id: tg.id, expires_at: sub.expires_at,
+      }).select('token, expires_at').single();
+      if (tokErr) throw new Error(`auth_tokens insert: ${tokErr.message}`);
+
+      // Key on the Telegram update_id so a webhook retry (5xx / network)
+      // dedupes against the UNIQUE constraint on telegram_events.idempotency_key.
+      const idemp = `access-${upd.update_id || `${tg.id}-${Date.now()}`}`;
+      await supabase.from('telegram_events').upsert({
+        event_type: 'auth_extend', telegram_user_id: tg.id,
+        idempotency_key: idemp,
+        related_subscription_id: sub.id,
+        metadata: { source: 'bot_command', token: tok.token, expires_at: tok.expires_at },
+      }, { onConflict: 'idempotency_key' });
+
+      const link = `${FRONTEND}?token=${tok.token}`;
+      const exp  = new Date(sub.expires_at).toLocaleDateString('ru-RU');
+      await tgSend(tg.id,
+        `🎫 <b>Доступ обновлён</b>\n\n📅 Подписка до: <b>${exp}</b>\n\n🔗 <b>Открыть PTJ:</b>\n${link}\n\n💡 Старый токен теперь недействителен.`,
+        { reply_markup: { inline_keyboard: [[{ text: '🎫 Открыть PTJ', url: link }]] } });
+    } catch (e) {
+      console.error('[/access]', e.message);
+      await tgSend(tg.id, `⚠️ Не удалось обновить доступ. Попробуй через минуту или напиши в поддержку.`);
+    }
+    return;
+  }
+
   if (upd.message?.text?.startsWith('/start')) {
     const tg = upd.message.from;
-    await tgSend(tg.id, `👋 <b>Привет, ${tg.first_name}!</b>\n\n📊 <b>Trader Diary</b> — профессиональный торговый журнал.\n\n• Binance / Bybit / BingX\n• P&L с нашими формулами\n• Аналитика + equity curve\n\n🛍 Купить: @ParadoxxShop_bot`);
+    await tgSend(tg.id,
+      `👋 <b>Привет, ${tg.first_name}!</b>\n\n📊 <b>Trader Diary</b> — профессиональный торговый журнал.\n\n• Binance / Bybit / BingX\n• P&L с нашими формулами\n• Аналитика + equity curve\n\n🛍 Купить: @ParadoxxShop_bot\n🎫 Уже купил? Нажми «Мои доступы» ниже или отправь /access.`,
+      { reply_markup: { keyboard: [[{ text: '🎫 Мои доступы' }]], resize_keyboard: true } });
   }
 }));
 
