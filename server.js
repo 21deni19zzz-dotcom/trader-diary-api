@@ -294,6 +294,18 @@ app.post('/api/auth/refresh', wrap(async (req, res) => {
   }).select('token, expires_at').single();
   if (insErr) throw new Error(`auth_tokens insert: ${insErr.message}`);
 
+  // Audit trail for the silent-401 refresh path. /refresh has no natural
+  // idempotency key (frontend retries opportunistically), so we synthesise
+  // one with a timestamp — each call gets its own row. Failure to log is
+  // non-fatal: rotation already succeeded.
+  const { error: evErr } = await supabase.from('telegram_events').insert({
+    event_type: 'auth_refresh',
+    telegram_user_id: tok.telegram_user_id,
+    idempotency_key: `refresh-${tok.telegram_user_id}-${crypto.randomUUID()}`,
+    metadata: { source: 'web', token_sha256: sha256(fresh.token), expires_at: fresh.expires_at },
+  });
+  if (evErr) console.error('[refresh] telegram_events insert:', evErr.message);
+
   res.json({ ok: true, token: fresh.token, expires_at: fresh.expires_at });
 }));
 
