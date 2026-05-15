@@ -101,6 +101,12 @@ function decrypt(data) {
   return d.update(enc, 'hex', 'utf8') + d.final('utf8');
 }
 
+// SHA256 digest used as opaque fingerprint for auth tokens stored in
+// telegram_events.metadata. The plaintext token lives only in auth_tokens
+// (the source of truth); metadata keeps just the digest so a read-leak of
+// telegram_events can't grant access. Replay-protection compares digests.
+function sha256(s) { return crypto.createHash('sha256').update(String(s)).digest('hex'); }
+
 // ── Validation ────────────────────────────────────────────────────────────────
 function validateFills(fills, errArr) {
   if (fills == null || fills === '') return [];
@@ -318,12 +324,21 @@ app.post('/api/auth/extend-from-bot', wrap(async (req, res) => {
   // issue a fresh one — then upsert the event so the cache catches up.
   const { data: prior } = await supabase.from('telegram_events')
     .select('metadata').eq('idempotency_key', idempotency_key).maybeSingle();
-  if (prior?.metadata?.token) {
+  if (prior?.metadata?.token_sha256) {
+    // Look up the user's current live token, then compare its digest to the
+    // one we cached at first-issue. If they match, this is a true replay and
+    // we return the same plaintext (from auth_tokens, the source of truth).
+    // If they don't match (token rotated/revoked since), fall through to a
+    // fresh issuance — same behaviour as before the hashing change.
     const { data: live } = await supabase.from('auth_tokens')
-      .select('token').eq('token', prior.metadata.token)
-      .eq('revoked', false).gt('expires_at', new Date().toISOString()).maybeSingle();
-    if (live) {
-      return res.json({ ok: true, token: prior.metadata.token, expires_at: prior.metadata.expires_at, replay: true });
+      .select('token, expires_at')
+      .eq('telegram_user_id', tg_id)
+      .eq('revoked', false)
+      .gt('expires_at', new Date().toISOString())
+      .order('expires_at', { ascending: false })
+      .limit(1).maybeSingle();
+    if (live && sha256(live.token) === prior.metadata.token_sha256) {
+      return res.json({ ok: true, token: live.token, expires_at: live.expires_at, replay: true });
     }
   }
 
@@ -345,7 +360,7 @@ app.post('/api/auth/extend-from-bot', wrap(async (req, res) => {
     telegram_user_id: tg_id,
     idempotency_key,
     related_subscription_id: sub.id,
-    metadata: { source: 'bot', token: fresh.token, expires_at: fresh.expires_at },
+    metadata: { source: 'bot', token_sha256: sha256(fresh.token), expires_at: fresh.expires_at },
   }, { onConflict: 'idempotency_key' });
   if (evErr) console.error('[extend-from-bot] telegram_events upsert:', evErr.message);
 
@@ -466,7 +481,7 @@ app.post('/api/webhook/telegram', wrap(async (req, res) => {
         event_type: 'auth_extend', telegram_user_id: tg.id,
         idempotency_key: idemp,
         related_subscription_id: sub.id,
-        metadata: { source: 'bot_command', token: tok.token, expires_at: tok.expires_at },
+        metadata: { source: 'bot_command', token_sha256: sha256(tok.token), expires_at: tok.expires_at },
       }, { onConflict: 'idempotency_key' });
 
       const link = `${FRONTEND}?token=${tok.token}`;
