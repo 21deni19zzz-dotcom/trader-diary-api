@@ -85,6 +85,18 @@ app.use((req, res, next) => {
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('X-XSS-Protection', '1; mode=block');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  // HSTS — only meaningful over HTTPS, harmless over HTTP (browsers ignore).
+  // Railway terminates TLS, so served clients see this header and pin HTTPS
+  // for 1 year, including subdomains. preload is not requested — opt in to
+  // the public preload list only after a dry-run window in prod.
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  // CSP — this is a JSON API, never HTML. Lock down everything: no scripts,
+  // no inline, no frames, no third-party loads. If a misconfigured proxy or
+  // future endpoint ever returns HTML, the browser will refuse to execute
+  // anything in it. frame-ancestors mirrors X-Frame-Options DENY for modern
+  // browsers that have deprecated XFO in favour of CSP.
+  res.setHeader('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'; base-uri 'none'");
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
   res.removeHeader('X-Powered-By');
   next();
 });
@@ -119,8 +131,39 @@ const wrap = fn => async (req, res) => {
 
 async function tgSend(chat_id, text, extra = {}) {
   if (!BOT_TOKEN) return;
-  try { await fetch(`${TG_API}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id, text, parse_mode: 'HTML', ...extra }) }); }
-  catch (e) { console.error('[TG]', e.message); }
+  // 5-second hard cap — Telegram occasionally hangs the connection. Without
+  // this, a stuck send blocks the response handler that called us.
+  const ctl = new AbortController();
+  const to = setTimeout(() => ctl.abort(), 5000);
+  try {
+    await fetch(`${TG_API}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id, text, parse_mode: 'HTML', ...extra }),
+      signal: ctl.signal,
+    });
+  } catch (e) { console.error('[TG]', e.message); }
+  finally { clearTimeout(to); }
+}
+
+// Escape user-controlled text destined for tgSend (which uses parse_mode=HTML).
+// Unconditionally escapes `<`, `>`, `&` so no user payload can inject tags.
+// Server-controlled HTML formatting in templates is unaffected — it's
+// concatenated AFTER escaping the variables.
+function escapeTgHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+// Looser variant for admin/notify — still escapes everything first, but
+// re-opens a small whitelist of formatting tags so the operator can use
+// <b>/<i>/<u>/<code>/<pre> in announcements. <a> stays escaped (prevents
+// phishing-link channel via a leaked INTER_SERVICE_SECRET).
+const SAFE_TG_TAGS = /&lt;(\/?(?:b|i|u|s|code|pre))&gt;/gi;
+function safeTgHtmlWithFormatting(text) {
+  return escapeTgHtml(text).replace(SAFE_TG_TAGS, '<$1>');
 }
 
 // ── Encryption ────────────────────────────────────────────────────────────────
@@ -447,10 +490,13 @@ app.post('/api/admin/notify-user', wrap(async (req, res) => {
   if (text.length < 1 || text.length > 4000) return res.status(400).json({ ok: false, error: 'text required (1..4000 chars)' });
   if (url && !/^https:\/\//i.test(url)) return res.status(400).json({ ok: false, error: 'url must be https' });
 
-  // Strip <a> tags from the message body so a leaked INTER_SERVICE_SECRET
-  // can't be turned into a phishing-link delivery channel via the verified
-  // bot. Legitimate clickable navigation goes through the `url` button.
-  const safeText = text.replace(/<\s*a\b[^>]*>/gi, '').replace(/<\s*\/\s*a\s*>/gi, '');
+  // Escape-then-allow approach: first HTML-escape everything (so any user
+  // payload like <a href=...> or <script> becomes inert text), then re-open
+  // a small whitelist of safe formatting tags (b/i/u/s/code/pre). <a> stays
+  // escaped — a leaked INTER_SERVICE_SECRET should not be turnable into a
+  // phishing-link delivery channel via the verified bot. Legitimate clickable
+  // navigation is the `url` button below.
+  const safeText = safeTgHtmlWithFormatting(text);
   const extra = url ? { reply_markup: { inline_keyboard: [[{ text: '🎫 Открыть PTJ', url }]] } } : {};
   await tgSend(tg_id, safeText, extra);
   res.json({ ok: true });
@@ -676,7 +722,46 @@ const extOf = (mime) => ({
   'image/webp': 'webp',
 }[mime] || 'bin');
 
+// Per-user upload quota (sliding window). The global IP rate-limit already
+// caps abuse from a single source, but a logged-in user could still spam
+// uploads up to that 60-req/min ceiling — at 5 MB each that fills storage
+// faster than we'd notice. This separate budget caps a single account to
+// 30 uploads per hour. In-memory only (resets on restart, single-instance
+// Railway service today); migrate to Redis when we scale out.
+const UPLOAD_WINDOW = 60 * 60 * 1000;   // 1 hour
+const UPLOAD_MAX    = 30;               // per user per window
+const uploadHits    = new Map();        // userId → number[] of timestamps
+function uploadQuota(userId) {
+  const now = Date.now();
+  const cutoff = now - UPLOAD_WINDOW;
+  const hits = (uploadHits.get(userId) || []).filter((t) => t >= cutoff);
+  if (hits.length >= UPLOAD_MAX) {
+    const oldest = hits[0];
+    const retryAfter = Math.max(1, Math.ceil((oldest + UPLOAD_WINDOW - now) / 1000));
+    return { ok: false, retryAfter };
+  }
+  hits.push(now);
+  uploadHits.set(userId, hits);
+  return { ok: true, remaining: UPLOAD_MAX - hits.length };
+}
+// Periodic GC so the Map doesn't grow without bound when users churn.
+setInterval(() => {
+  const cutoff = Date.now() - UPLOAD_WINDOW * 2;
+  for (const [k, v] of uploadHits) {
+    const trimmed = v.filter((t) => t >= cutoff);
+    if (trimmed.length === 0) uploadHits.delete(k);
+    else uploadHits.set(k, trimmed);
+  }
+}, UPLOAD_WINDOW);
+
 app.post('/api/uploads/screenshot', requireAuth, (req, res) => {
+  // Apply quota BEFORE parsing the multipart body — refuses early so a
+  // quota-exhausted client doesn't burn the 5 MB upload bandwidth budget.
+  const q = uploadQuota(req.userId);
+  if (!q.ok) {
+    res.setHeader('Retry-After', String(q.retryAfter));
+    return res.status(429).json({ ok: false, error: `Upload quota: ${UPLOAD_MAX}/hour. Retry in ${q.retryAfter}s.` });
+  }
   upload.single('file')(req, res, async (err) => {
     if (err) return res.status(400).json({ ok: false, error: err.message });
     if (!req.file) return res.status(400).json({ ok: false, error: 'No file' });
