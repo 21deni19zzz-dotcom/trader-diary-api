@@ -318,7 +318,7 @@ app.post('/api/auth/refresh', wrap(async (req, res) => {
   if (!tok) return res.status(401).json({ ok: false, error: 'Token not found or revoked' });
 
   const { data: sub } = await supabase.from('subscriptions')
-    .select('expires_at').eq('telegram_user_id', tok.telegram_user_id)
+    .select('product_id, expires_at').eq('telegram_user_id', tok.telegram_user_id)
     .in('status', ['active', 'trial']).gt('expires_at', new Date().toISOString())
     .order('expires_at', { ascending: false }).limit(1).maybeSingle();
   if (!sub) return res.status(403).json({ ok: false, error: 'No active subscription' });
@@ -329,6 +329,26 @@ app.post('/api/auth/refresh', wrap(async (req, res) => {
     telegram_user_id: tok.telegram_user_id, expires_at: sub.expires_at,
   }).select('token, expires_at').single();
   if (insErr) throw new Error(`auth_tokens insert: ${insErr.message}`);
+
+  // B1 closure — same dual-sync as /extend-from-bot. Without this, web-driven
+  // rotation rotates the auth_token but leaves the bot's cached invite_link
+  // pointing at the old token, so "🎫 Открыть" in Telegram 401s after the
+  // user refreshes from the web. Best-effort: rotation already succeeded.
+  const inviteLink = `${FRONTEND}/?token=${fresh.token}`;
+  const { error: subErr } = await supabase.from('subscriptions')
+    .update({ telegram_invite_link: inviteLink, updated_at: new Date().toISOString() })
+    .eq('telegram_user_id', tok.telegram_user_id)
+    .in('status', ['active', 'trial']);
+  if (subErr) console.error('[refresh] subscription invite_link sync:', subErr.message);
+
+  if (sub.product_id) {
+    const { error: uaErr } = await supabase.from('user_accesses')
+      .update({ expires_at: sub.expires_at })
+      .eq('telegram_user_id', tok.telegram_user_id)
+      .eq('product_id', sub.product_id)
+      .is('revoked_at', null);
+    if (uaErr) console.error('[refresh] user_accesses expires_at sync:', uaErr.message);
+  }
 
   // Audit trail for the silent-401 refresh path. /refresh has no natural
   // idempotency key (frontend retries opportunistically), so we synthesise
@@ -533,6 +553,29 @@ app.post('/api/webhook/telegram', wrap(async (req, res) => {
       const { data: tok } = await supabase.from('auth_tokens').insert({
         telegram_user_id: tg.id, expires_at: expiresAt
       }).select('token').single();
+
+      // B1 closure — same dual-sync as /extend-from-bot, applied at payment time.
+      // New purchase / renewal: the freshly inserted subscription needs its
+      // telegram_invite_link to track the just-issued token, and user_accesses
+      // needs the new expires_at. Best-effort: payment_success is a hot path
+      // and the auth_tokens row is already the authoritative entitlement —
+      // sync failures are logged, never thrown.
+      if (tok?.token) {
+        const inviteLink = `${FRONTEND}/?token=${tok.token}`;
+        const { error: subSyncErr } = await supabase.from('subscriptions')
+          .update({ telegram_invite_link: inviteLink, updated_at: new Date().toISOString() })
+          .eq('telegram_user_id', tg.id)
+          .in('status', ['active', 'trial']);
+        if (subSyncErr) console.error('[payment_success] subscription invite_link sync:', subSyncErr.message);
+
+        const { error: uaErr } = await supabase.from('user_accesses')
+          .update({ expires_at: expiresAt })
+          .eq('telegram_user_id', tg.id)
+          .eq('product_id', prod.id)
+          .is('revoked_at', null);
+        if (uaErr) console.error('[payment_success] user_accesses expires_at sync:', uaErr.message);
+      }
+
       await supabase.from('telegram_events').insert({
         event_type: 'payment_success', telegram_user_id: tg.id, product_id: prod.id,
         payment_method: 'stars', payment_tx_id: pay.telegram_payment_charge_id,
