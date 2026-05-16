@@ -5,6 +5,7 @@ import cron from 'node-cron';
 import crypto from 'node:crypto';
 import { createClient } from '@supabase/supabase-js';
 import multer from 'multer';
+import Anthropic from '@anthropic-ai/sdk';
 import 'dotenv/config';
 
 const app  = express();
@@ -467,6 +468,113 @@ app.post('/api/admin/notify-user', wrap(async (req, res) => {
   const extra = url ? { reply_markup: { inline_keyboard: [[{ text: '🎫 Открыть PTJ', url }]] } } : {};
   await tgSend(tg_id, safeText, extra);
   res.json({ ok: true });
+}));
+
+// ── AI Coach (Sprint 9B) ──────────────────────────────────────────────────────
+// POST /api/coach/insight  (Bearer auth)
+// Streams an Anthropic-generated trading insight as Server-Sent Events.
+// Rate-limited via telegram_events (no new table per Karpathy 2 — Simplicity
+// First): 1 request per 30 minutes per user, 30 requests per calendar month.
+// Cost cap is enforced by the rate limit + max_tokens=800 in the model call.
+// Frontend consumes the stream via fetch + ReadableStream (EventSource is
+// GET-only; we want Authorization header without exposing tokens in URL).
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
+const anthropic = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
+if (!ANTHROPIC_API_KEY) {
+  console.warn('[boot] ANTHROPIC_API_KEY not set — /api/coach/insight will return 503');
+}
+
+app.post('/api/coach/insight', requireAuth, wrap(async (req, res) => {
+  if (!anthropic) {
+    return res.status(503).json({ ok: false, error: 'AI Coach not configured (ANTHROPIC_API_KEY missing)' });
+  }
+  const userId = req.userId;
+
+  // Rate limit: 30 min cooldown via telegram_events. Idempotent reads only —
+  // no mutation yet; we insert the event after a successful stream completes
+  // so a network blip doesn't burn a request slot.
+  const since30min = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  const { data: recent } = await supabase.from('telegram_events')
+    .select('id, created_at')
+    .eq('telegram_user_id', userId)
+    .eq('event_type', 'coach_request')
+    .gte('created_at', since30min)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (recent) {
+    const waitSec = Math.max(1, Math.ceil((new Date(recent.created_at).getTime() + 30*60*1000 - Date.now()) / 1000));
+    return res.status(429).json({ ok: false, error: 'Rate limit: 1 request per 30 minutes', retry_after_seconds: waitSec });
+  }
+
+  // Monthly cap: 30 per calendar month.
+  const startOfMonth = new Date();
+  startOfMonth.setUTCDate(1); startOfMonth.setUTCHours(0, 0, 0, 0);
+  const { count: monthCount } = await supabase.from('telegram_events')
+    .select('id', { count: 'exact', head: true })
+    .eq('telegram_user_id', userId)
+    .eq('event_type', 'coach_request')
+    .gte('created_at', startOfMonth.toISOString());
+  if ((monthCount ?? 0) >= 30) {
+    return res.status(429).json({ ok: false, error: 'Monthly limit reached (30/month). Resets next month.' });
+  }
+
+  // Pull last 20 closed trades, most recent first.
+  const { data: trades, error: tErr } = await supabase.from('trades')
+    .select('symbol, direction, entry_price, exit_price, pnl, pnl_pct, setup, emotion, entry_date, exit_date')
+    .eq('telegram_user_id', userId)
+    .eq('status', 'closed')
+    .order('exit_date', { ascending: false })
+    .nullsLast()
+    .limit(20);
+  if (tErr) throw new Error(`trades fetch: ${tErr.message}`);
+  if (!trades || trades.length === 0) {
+    return res.status(400).json({ ok: false, error: 'Need at least 1 closed trade for an insight' });
+  }
+
+  const summary = trades.map(t => {
+    const pnl = (t.pnl ?? 0).toFixed ? (+t.pnl).toFixed(2) : t.pnl;
+    const pct = (t.pnl_pct ?? 0).toFixed ? (+t.pnl_pct).toFixed(2) : t.pnl_pct;
+    return `${t.entry_date || '?'}: ${t.symbol} ${t.direction} ${t.entry_price}→${t.exit_price ?? '?'} pnl=$${pnl} (${pct}%) setup=${t.setup || '—'} emotion=${t.emotion || '—'}`;
+  }).join('\n');
+
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  let totalText = '';
+  try {
+    const stream = await anthropic.messages.stream({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 800,
+      system: `Ты опытный трейдер-наставник в Paradox Trade Journal. Анализируй сделки клиента и давай конкретный, прямой фидбэк. Фокус: (1) Психологические паттерны (FOMO, страх, жадность, tilt). (2) Риск-менеджмент (размер позиций, стопы, R:R). (3) Сетапы которые работают и не работают по статистике. (4) Конкретные действия на следующую неделю. Тон: дружелюбный, без воды, без воды. Русский язык. Максимум 800 токенов.`,
+      messages: [{ role: 'user', content: `Проанализируй мои последние ${trades.length} сделок и дай honest feedback:\n\n${summary}` }],
+    });
+    for await (const event of stream) {
+      if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta' && event.delta.text) {
+        totalText += event.delta.text;
+        res.write(`data: ${JSON.stringify({ text: event.delta.text })}\n\n`);
+      }
+    }
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } catch (err) {
+    console.error('[coach/insight] stream error:', err?.message || err);
+    // Best-effort error frame — client may have already buffered partial text.
+    try { res.write(`data: ${JSON.stringify({ error: 'Anthropic stream failed' })}\n\n`); res.end(); } catch {}
+    return;
+  }
+
+  // Log successful request only (failed streams don't burn the user's quota).
+  const { error: evErr } = await supabase.from('telegram_events').insert({
+    event_type: 'coach_request',
+    telegram_user_id: userId,
+    idempotency_key: `coach-${userId}-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`,
+    metadata: { trades_analyzed: trades.length, output_chars: totalText.length, model: 'claude-sonnet-4-5' },
+  });
+  if (evErr) console.error('[coach/insight] event log:', evErr.message);
 }));
 
 // ── Webhook ───────────────────────────────────────────────────────────────────
