@@ -410,6 +410,19 @@ app.post('/api/auth/extend-from-bot', wrap(async (req, res) => {
   }).select('token, expires_at').single();
   if (insErr) throw new Error(`auth_tokens insert: ${insErr.message}`);
 
+  // B1 permanent fix — sync subscriptions.telegram_invite_link with the fresh
+  // token. Without this, the bot's "🎫 Открыть" cached the original purchase
+  // token; once /extend-from-bot rotates the auth_token, the cached link 401s
+  // and the bot falls back to "не настроен URL входа" because access_url is
+  // checked but the invite_link was stale. Best-effort: failure here is
+  // logged, not fatal — the issued token is the authoritative result.
+  const inviteLink = `https://trader-diary-rust.vercel.app/?token=${fresh.token}`;
+  const { error: subErr } = await supabase.from('subscriptions')
+    .update({ telegram_invite_link: inviteLink, updated_at: new Date().toISOString() })
+    .eq('telegram_user_id', tg_id)
+    .in('status', ['active', 'trial']);
+  if (subErr) console.error('[extend-from-bot] subscription invite_link sync:', subErr.message);
+
   const { error: evErr } = await supabase.from('telegram_events').upsert({
     event_type: 'auth_extend',
     telegram_user_id: tg_id,
