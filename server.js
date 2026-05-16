@@ -231,6 +231,28 @@ function validateTrade(t) {
   const fillsClean = validateFills(t.fills, err);
   const shotsClean = validateShots(t.shots, err);
   const safe = s => s ? String(s).slice(0, 200).replace(/<[^>]*>/g, '') : null;
+
+  // strategy_id: optional uuid (matches Paradox Coach coach_strategies.id).
+  // Reject anything that doesn't look like a v4 UUID to avoid letting a
+  // malformed client value reach the trades.strategy_id FK constraint.
+  let strategyId = null;
+  if (t.strategy_id != null && t.strategy_id !== '') {
+    const s = String(t.strategy_id);
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)) {
+      strategyId = s;
+    } else {
+      err.push('strategy_id: uuid expected');
+    }
+  }
+
+  // was_in_plan: boolean tri-state. null = unanswered (legacy rows), true =
+  // explicitly "yes, followed the plan", false = "no". Accepting only those
+  // three keeps Coach's adherence stats unambiguous.
+  let wasInPlan = null;
+  if (t.was_in_plan === true || t.was_in_plan === 'true')  wasInPlan = true;
+  else if (t.was_in_plan === false || t.was_in_plan === 'false') wasInPlan = false;
+  else if (t.was_in_plan != null && t.was_in_plan !== '') err.push('was_in_plan: boolean expected');
+
   return { err, clean: {
     symbol: String(t.symbol || '').toUpperCase().trim().slice(0, 20), direction: t.direction,
     status: t.status || 'open',
@@ -243,6 +265,8 @@ function validateTrade(t) {
     exchange: safe(t.exchange) || 'manual',
     fills: fillsClean,
     shots: shotsClean,
+    strategy_id: strategyId,
+    was_in_plan: wasInPlan,
   }};
 }
 
@@ -670,6 +694,8 @@ app.post('/api/trades', requireAuth, wrap(async (req, res) => {
     setup: t.setup, emotion: t.emotion, notes: t.notes, exchange: t.exchange,
     fills: t.fills,
     shots: t.shots,
+    strategy_id: t.strategy_id,
+    was_in_plan: t.was_in_plan,
   }).select().single();
   if (error) throw new Error(error.message);
   res.json({ ok: true, trade: data });
@@ -687,6 +713,8 @@ app.patch('/api/trades/:id', requireAuth, wrap(async (req, res) => {
     setup: t.setup, emotion: t.emotion, notes: t.notes,
     fills: t.fills,
     shots: t.shots,
+    strategy_id: t.strategy_id,
+    was_in_plan: t.was_in_plan,
     updated_at: new Date().toISOString(),
   };
 
