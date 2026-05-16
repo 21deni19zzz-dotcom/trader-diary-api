@@ -1021,6 +1021,271 @@ app.post('/api/connect', requireAuth, (req, res) => {
   app.handle(req, res);
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// PARADOX COACH — profile, strategies, rules catalog, insights, weights, cron
+// (Sprint 9B+ — rule-based + Bayesian self-learning, $0/mo. Schema in migration
+// `paradox_coach_schema`. Frontend renders user-facing copy via own rules.js;
+// backend ONLY persists state + evaluates outcomes for the Bayesian update.)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const COACH_PROFILE_FIELDS = [
+  'tone','language','account_balance','base_currency',
+  'max_risk_per_trade_pct','max_daily_risk_pct','max_weekly_dd_pct',
+  'max_concurrent_positions','use_kelly','kelly_fraction','markets_traded',
+  'preferred_sessions','trading_style','avg_hold_time_hours',
+  'monthly_goal_pct','monthly_goal_usd','insights_per_session',
+  'min_trades_for_pattern','enabled_categories','disabled_rules',
+];
+
+const COACH_STRATEGY_FIELDS = [
+  'name','description','entry_rules','exit_rules',
+  'risk_per_trade_pct','max_positions','expected_winrate','expected_rr',
+  'expected_trades_per_week','status',
+];
+
+// ── Profile ───────────────────────────────────────────────────────────────────
+app.get('/api/coach/profile', requireAuth, wrap(async (req, res) => {
+  const { data, error } = await supabase
+    .from('coach_user_profile').select('*')
+    .eq('telegram_user_id', req.userId).maybeSingle();
+  if (error) return res.status(500).json({ ok: false, error: error.message });
+  res.json({ ok: true, profile: data });
+}));
+
+app.put('/api/coach/profile', requireAuth, wrap(async (req, res) => {
+  const updates = { updated_at: new Date().toISOString() };
+  for (const k of COACH_PROFILE_FIELDS) if (req.body?.[k] !== undefined) updates[k] = req.body[k];
+  const { data, error } = await supabase
+    .from('coach_user_profile')
+    .upsert({ telegram_user_id: req.userId, ...updates }, { onConflict: 'telegram_user_id' })
+    .select().single();
+  if (error) return res.status(500).json({ ok: false, error: error.message });
+  res.json({ ok: true, profile: data });
+}));
+
+// ── Strategies ────────────────────────────────────────────────────────────────
+app.get('/api/coach/strategies', requireAuth, wrap(async (req, res) => {
+  const { data, error } = await supabase
+    .from('coach_strategies')
+    .select('*, coach_strategy_performance(*)')
+    .eq('telegram_user_id', req.userId)
+    .order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ ok: false, error: error.message });
+  res.json({ ok: true, strategies: data || [] });
+}));
+
+app.post('/api/coach/strategies', requireAuth, wrap(async (req, res) => {
+  const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+  if (!name || name.length > 200) return res.status(400).json({ ok: false, error: 'name required (1..200 chars)' });
+  const row = { telegram_user_id: req.userId, name };
+  for (const k of COACH_STRATEGY_FIELDS) if (k !== 'name' && req.body?.[k] !== undefined) row[k] = req.body[k];
+  const { data, error } = await supabase.from('coach_strategies').insert(row).select().single();
+  if (error) return res.status(500).json({ ok: false, error: error.message });
+  res.status(201).json({ ok: true, strategy: data });
+}));
+
+app.put('/api/coach/strategies/:id', requireAuth, wrap(async (req, res) => {
+  const { id } = req.params;
+  // Verify ownership first (cheap defence-in-depth on top of RLS)
+  const { data: existing } = await supabase.from('coach_strategies')
+    .select('telegram_user_id').eq('id', id).maybeSingle();
+  if (!existing || existing.telegram_user_id !== req.userId) {
+    return res.status(404).json({ ok: false, error: 'strategy not found' });
+  }
+  const updates = { updated_at: new Date().toISOString() };
+  for (const k of COACH_STRATEGY_FIELDS) if (req.body?.[k] !== undefined) updates[k] = req.body[k];
+  const { data, error } = await supabase.from('coach_strategies')
+    .update(updates).eq('id', id).select().single();
+  if (error) return res.status(500).json({ ok: false, error: error.message });
+  res.json({ ok: true, strategy: data });
+}));
+
+app.delete('/api/coach/strategies/:id', requireAuth, wrap(async (req, res) => {
+  const { error } = await supabase.from('coach_strategies')
+    .delete().eq('id', req.params.id).eq('telegram_user_id', req.userId);
+  if (error) return res.status(500).json({ ok: false, error: error.message });
+  res.json({ ok: true });
+}));
+
+app.get('/api/coach/strategies/:id/performance', requireAuth, wrap(async (req, res) => {
+  const { id } = req.params;
+  // Verify ownership first
+  const { data: strat } = await supabase.from('coach_strategies')
+    .select('telegram_user_id').eq('id', id).maybeSingle();
+  if (!strat || strat.telegram_user_id !== req.userId) {
+    return res.status(404).json({ ok: false, error: 'strategy not found' });
+  }
+  const { data } = await supabase.from('coach_strategy_performance')
+    .select('*').eq('strategy_id', id).maybeSingle();
+  res.json({ ok: true, performance: data });
+}));
+
+// ── Rules catalog (read-only) ─────────────────────────────────────────────────
+app.get('/api/coach/rules', requireAuth, wrap(async (_req, res) => {
+  const { data, error } = await supabase.from('coach_rules')
+    .select('id, category, severity, target_metric, target_direction, evaluation_window_trades, min_sample_size, confidence_threshold')
+    .eq('is_active', true);
+  if (error) return res.status(500).json({ ok: false, error: error.message });
+  res.json({ ok: true, rules: data || [] });
+}));
+
+// ── Insights — frontend computes, backend persists ───────────────────────────
+app.post('/api/coach/insights', requireAuth, wrap(async (req, res) => {
+  const { rule_id, strategy_id = null, title, body, action,
+          baseline_metrics, trades_count_at_show } = req.body || {};
+  if (!rule_id || !title || !body || !action || !baseline_metrics) {
+    return res.status(400).json({ ok: false, error: 'rule_id, title, body, action, baseline_metrics required' });
+  }
+  if (typeof trades_count_at_show !== 'number' || trades_count_at_show < 0) {
+    return res.status(400).json({ ok: false, error: 'trades_count_at_show must be non-negative number' });
+  }
+  const { data, error } = await supabase.from('coach_insights').insert({
+    telegram_user_id: req.userId,
+    rule_id, strategy_id, title, body, action,
+    baseline_metrics, trades_count_at_show,
+  }).select().single();
+  if (error) return res.status(500).json({ ok: false, error: error.message });
+
+  // Increment total_shown (best-effort)
+  supabase.rpc('update_rule_weight', {
+    p_rule_id: rule_id, p_user_id: req.userId, p_improved: null,
+  }).then(({ error: rpcErr }) => { if (rpcErr) console.error('[coach/insights] update_rule_weight:', rpcErr.message); });
+
+  res.status(201).json({ ok: true, insight: data });
+}));
+
+app.get('/api/coach/insights', requireAuth, wrap(async (req, res) => {
+  const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 200);
+  const { data, error } = await supabase.from('coach_insights')
+    .select('*').eq('telegram_user_id', req.userId)
+    .order('shown_at', { ascending: false }).limit(limit);
+  if (error) return res.status(500).json({ ok: false, error: error.message });
+  res.json({ ok: true, insights: data || [] });
+}));
+
+app.patch('/api/coach/insights/:id', requireAuth, wrap(async (req, res) => {
+  const allowed = ['acknowledged_at','dismissed_at','user_rating','user_comment'];
+  const updates = {};
+  for (const k of allowed) if (req.body?.[k] !== undefined) updates[k] = req.body[k];
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).json({ ok: false, error: 'no allowed fields in body' });
+  }
+  if ('user_rating' in updates && ![-1, 0, 1, null].includes(updates.user_rating)) {
+    return res.status(400).json({ ok: false, error: 'user_rating must be -1, 0, or 1' });
+  }
+  const { data, error } = await supabase.from('coach_insights')
+    .update(updates).eq('id', req.params.id).eq('telegram_user_id', req.userId)
+    .select().maybeSingle();
+  if (error) return res.status(500).json({ ok: false, error: error.message });
+  if (!data) return res.status(404).json({ ok: false, error: 'insight not found' });
+  res.json({ ok: true, insight: data });
+}));
+
+// ── Bayesian weights for frontend ranker ─────────────────────────────────────
+app.get('/api/coach/weights', requireAuth, wrap(async (req, res) => {
+  const { data: globalRows } = await supabase.from('coach_rule_weights')
+    .select('rule_id, weight, alpha, beta, total_evaluated').is('telegram_user_id', null);
+  const { data: personalRows } = await supabase.from('coach_rule_weights')
+    .select('rule_id, weight, alpha, beta, total_evaluated').eq('telegram_user_id', req.userId);
+
+  const weights = {};
+  for (const g of globalRows || []) {
+    weights[g.rule_id] = { global: Number(g.weight), personal: null, evaluated: 0 };
+  }
+  for (const p of personalRows || []) {
+    weights[p.rule_id] = weights[p.rule_id] || { global: 0.5, personal: null, evaluated: 0 };
+    weights[p.rule_id].personal = Number(p.weight);
+    weights[p.rule_id].evaluated = p.total_evaluated || 0;
+  }
+  res.json({ ok: true, weights });
+}));
+
+// ── Cron: evaluate insight outcomes (Bayesian feedback loop) ─────────────────
+function _coachComputeMetrics(trades) {
+  if (!Array.isArray(trades) || trades.length === 0) return { n_trades: 0 };
+  const wins = trades.filter((t) => Number(t.pnl) > 0);
+  const losses = trades.filter((t) => Number(t.pnl) < 0);
+  const winrate = trades.length ? wins.length / trades.length : 0;
+  const totalPnl = trades.reduce((s, t) => s + Number(t.pnl || 0), 0);
+  const grossWin = wins.reduce((s, t) => s + Number(t.pnl || 0), 0);
+  const grossLoss = Math.abs(losses.reduce((s, t) => s + Number(t.pnl || 0), 0));
+  const winRs = wins.map((t) => Number(t.rr || 0)).filter((r) => r > 0);
+  const lossRs = losses.map((t) => -Math.abs(Number(t.rr || 0))).filter((r) => r < 0);
+  const avgWinR = winRs.length ? winRs.reduce((s, r) => s + r, 0) / winRs.length : 0;
+  const avgLossR = lossRs.length ? lossRs.reduce((s, r) => s + r, 0) / lossRs.length : 0;
+  const expectancy_r = winrate * avgWinR + (1 - winrate) * avgLossR;
+  // Equity curve for drawdown (cumulative pnl since first trade in window)
+  let peak = 0, balance = 0, maxDD = 0;
+  for (const t of trades) {
+    balance += Number(t.pnl || 0);
+    if (balance > peak) peak = balance;
+    const dd = peak > 0 ? (peak - balance) / peak : 0;
+    if (dd > maxDD) maxDD = dd;
+  }
+  return {
+    winrate,
+    expectancy_r,
+    expectancy_usd: trades.length ? totalPnl / trades.length : 0,
+    profit_factor: grossLoss > 0 ? grossWin / grossLoss : (grossWin > 0 ? 99 : 0),
+    max_dd_pct: maxDD * 100,
+    avg_win_r: avgWinR,
+    avg_loss_r: avgLossR,
+    n_trades: trades.length,
+  };
+}
+
+async function evaluateInsightOutcomes() {
+  // Insights without outcome shown > 7 days ago, with enough trades after to evaluate.
+  const cutoff = new Date(Date.now() - 7 * 86400000).toISOString();
+  const { data: pending, error: pErr } = await supabase
+    .from('coach_insights')
+    .select('id, telegram_user_id, rule_id, shown_at, baseline_metrics, coach_rules!inner(target_metric, target_direction, evaluation_window_trades)')
+    .is('outcome_evaluated_at', null)
+    .lt('shown_at', cutoff)
+    .limit(100);
+  if (pErr) { console.error('[coach/cron] pending fetch:', pErr.message); return; }
+
+  for (const ins of pending || []) {
+    const target = ins.coach_rules?.target_metric;
+    const direction = ins.coach_rules?.target_direction;
+    const windowN = ins.coach_rules?.evaluation_window_trades || 10;
+    if (!target || !direction) continue;
+
+    const { data: tradesAfter } = await supabase.from('trades')
+      .select('pnl, rr')
+      .eq('telegram_user_id', ins.telegram_user_id)
+      .eq('status', 'closed')
+      .gte('exit_date', ins.shown_at)
+      .order('exit_date', { ascending: true })
+      .limit(windowN);
+    if (!tradesAfter || tradesAfter.length < windowN) continue; // wait more data
+
+    const newStats = _coachComputeMetrics(tradesAfter);
+    const baseline = ins.baseline_metrics || {};
+    const baseVal = baseline[target];
+    const newVal  = newStats[target];
+    if (baseVal == null || newVal == null) continue;
+
+    const improved = direction === 'increase'
+      ? Number(newVal) > Number(baseVal) * 1.05
+      : Number(newVal) < Number(baseVal) * 0.95;
+    const delta = (Number(newVal) - Number(baseVal)) / (Math.abs(Number(baseVal)) || 1);
+
+    const { error: uErr } = await supabase.from('coach_insights').update({
+      outcome_evaluated_at: new Date().toISOString(),
+      outcome_metrics: newStats,
+      outcome_improved: improved,
+      outcome_delta: delta,
+    }).eq('id', ins.id);
+    if (uErr) { console.error('[coach/cron] insight update:', uErr.message); continue; }
+
+    const { error: rpcErr } = await supabase.rpc('update_rule_weight', {
+      p_rule_id: ins.rule_id, p_user_id: ins.telegram_user_id, p_improved: improved,
+    });
+    if (rpcErr) console.error('[coach/cron] update_rule_weight:', rpcErr.message);
+  }
+}
+
 // ── Cron ──────────────────────────────────────────────────────────────────────
 async function sendReminders() {
   const now = new Date();
@@ -1065,6 +1330,12 @@ async function sendReminders() {
     .eq('revoked', false).lt('expires_at', now.toISOString());
 }
 cron.schedule('0 10 * * *', sendReminders);
+
+// Paradox Coach — daily 03:00 UTC outcome evaluation (Bayesian feedback loop).
+// Always wrap in try/catch so cron doesn't crash on a single bad row.
+cron.schedule('0 3 * * *', () => {
+  evaluateInsightOutcomes().catch((e) => console.error('[coach/cron]', e?.message || e));
+});
 
 // ── Error handlers ────────────────────────────────────────────────────────────
 app.use((req, res) => res.status(404).json({ ok: false, error: `Not found: ${req.method} ${req.path}` }));
