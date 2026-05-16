@@ -399,7 +399,7 @@ app.post('/api/auth/extend-from-bot', wrap(async (req, res) => {
   }
 
   const { data: sub } = await supabase.from('subscriptions')
-    .select('id, expires_at').eq('telegram_user_id', tg_id)
+    .select('id, expires_at, product_id').eq('telegram_user_id', tg_id)
     .in('status', ['active', 'trial']).gt('expires_at', new Date().toISOString())
     .order('expires_at', { ascending: false }).limit(1).maybeSingle();
   if (!sub) return res.status(404).json({ ok: false, error: 'No active subscription for this telegram_user_id' });
@@ -423,6 +423,18 @@ app.post('/api/auth/extend-from-bot', wrap(async (req, res) => {
     .eq('telegram_user_id', tg_id)
     .in('status', ['active', 'trial']);
   if (subErr) console.error('[extend-from-bot] subscription invite_link sync:', subErr.message);
+
+  // B1 follow-up — also sync user_accesses.expires_at so the bot's access-grant
+  // table reflects the new subscription expiry. user_accesses is the second
+  // source of truth the bot checks for "is the user entitled to product X" —
+  // if it lags behind subscription.expires_at after a rotation/renewal, the
+  // bot can still refuse access even with a valid token.
+  const { error: uaErr } = await supabase.from('user_accesses')
+    .update({ expires_at: sub.expires_at })
+    .eq('telegram_user_id', tg_id)
+    .eq('product_id', sub.product_id)
+    .is('revoked_at', null);
+  if (uaErr) console.error('[extend-from-bot] user_accesses expires_at sync:', uaErr.message);
 
   const { error: evErr } = await supabase.from('telegram_events').upsert({
     event_type: 'auth_extend',
