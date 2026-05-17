@@ -930,6 +930,301 @@ app.post('/api/exchange/positions', requireAuth, wrap(async (req, res) => {
   }
 }));
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Sprint 14 · Exchange history import
+// POST /api/exchange/sync-history
+//   body: { exchange, symbol?, since?, limit? }
+//
+// Pulls realized/closed trades from the user's connected exchange and upserts
+// them into `trades` keyed on (telegram_user_id, exchange, exchange_order_id),
+// so repeat calls are idempotent.
+//
+// Strategy (try-then-fallback):
+//   1) fetchPositionHistory  — CCXT 4.4+, BingX/Bybit. Cleanest: each row is
+//                              a paired entry+exit with realized PnL.
+//   2) fetchClosedOrders     — every exchange. We treat each closed order as
+//                              a discrete closed-trade row; users can refine
+//                              entry/exit by editing once it's in the journal.
+//
+// Per-user-per-exchange cooldown (30s) prevents the user double-clicking the
+// import button into a 429 from the exchange. Cooldown is in-memory; the
+// Railway dyno is single-instance so a Map is enough.
+// ─────────────────────────────────────────────────────────────────────────────
+const SYNC_COOLDOWN_MS = 30_000;
+const syncCooldown = new Map();
+
+const ymd = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : null;
+
+function normalizeSide(raw) {
+  const s = String(raw || '').toLowerCase();
+  if (s === 'long' || s === 'buy')  return 'long';
+  if (s === 'short' || s === 'sell') return 'short';
+  return s || 'long';
+}
+
+// Build a `trades` row from a CCXT position-history record. These records
+// already represent a closed position (entry + exit). When fields are missing
+// we fall back to the open-orders shape and let the caller decide.
+function rowFromPosition(p, userId, exchange) {
+  const orderId = p.id || p.info?.positionId || p.info?.posId || p.info?.id || null;
+  if (!orderId) return null;
+  const side = normalizeSide(p.side || p.info?.positionSide || p.info?.side);
+  const qty = +p.contracts || +p.amount || +p.info?.size || 0;
+  const entry = +p.entryPrice || +p.info?.entryPrice || +p.info?.avgPrice || 0;
+  const exit  = +p.exitPrice  || +p.info?.exitPrice  || +p.info?.closePrice || +p.info?.markPrice || 0;
+  const pnl   = +p.realizedPnl ?? +p.info?.realisedPnl ?? +p.info?.realizedPnl ?? null;
+  const openTs  = +p.timestamp || +p.info?.openTime || +p.info?.createTime || 0;
+  const closeTs = +p.lastUpdateTimestamp || +p.info?.closeTime || +p.info?.updateTime || openTs;
+  if (!qty || !entry) return null;
+  return {
+    telegram_user_id: userId,
+    symbol: p.symbol || p.info?.symbol,
+    direction: side,
+    status: 'closed',
+    entry_price: entry,
+    exit_price: exit || entry,
+    quantity: qty,
+    entry_date: ymd(openTs),
+    exit_date:  ymd(closeTs),
+    pnl: Number.isFinite(pnl) ? pnl : null,
+    exchange,
+    exchange_order_id: String(orderId),
+    exchange_position_id: p.info?.positionId ? String(p.info.positionId) : null,
+    source: 'import_' + exchange,
+  };
+}
+
+// Build a `trades` row from a CCXT closed order. Less rich than a position
+// record — we don't know the entry/exit pair, so we record the fill as a
+// single-leg closed trade and leave PnL null for the user to edit.
+function rowFromOrder(o, userId, exchange) {
+  const orderId = o.id || o.info?.orderId || o.info?.id || null;
+  if (!orderId) return null;
+  const filled = +o.filled || +o.amount || 0;
+  if (!filled) return null;
+  const avg = +o.average || +o.price || 0;
+  if (!avg) return null;
+  const side = normalizeSide(o.side);
+  const ts = +o.timestamp || +o.lastTradeTimestamp || 0;
+  return {
+    telegram_user_id: userId,
+    symbol: o.symbol,
+    direction: side,
+    status: 'closed',
+    entry_price: avg,
+    exit_price: avg,
+    quantity: filled,
+    entry_date: ymd(ts),
+    exit_date:  ymd(ts),
+    pnl: null,
+    exchange,
+    exchange_order_id: String(orderId),
+    exchange_position_id: null,
+    source: 'import_' + exchange,
+  };
+}
+
+app.post('/api/exchange/sync-history', requireAuth, wrap(async (req, res) => {
+  const { exchange, symbol, since, limit } = req.body || {};
+  valEx(exchange);
+
+  // Cooldown — defend the exchange's own rate limiter from over-eager users.
+  const key = `${req.userId}:${exchange}`;
+  const last = syncCooldown.get(key) || 0;
+  const elapsed = Date.now() - last;
+  if (elapsed < SYNC_COOLDOWN_MS) {
+    return res.status(429).json({
+      ok: false,
+      error: `cooldown:${Math.ceil((SYNC_COOLDOWN_MS - elapsed) / 1000)}`,
+    });
+  }
+  syncCooldown.set(key, Date.now());
+
+  // Cursor — resume where the last sync stopped, or default to last 90 days.
+  let cursorSince = Number.isFinite(+since) ? +since : null;
+  if (cursorSince == null) {
+    const { data: state } = await supabase.from('exchange_sync_state')
+      .select('last_synced_until')
+      .eq('telegram_user_id', req.userId).eq('exchange', exchange).maybeSingle();
+    cursorSince = state?.last_synced_until || (Date.now() - 90 * 86_400_000);
+  }
+  const lim = Math.min(500, Math.max(1, +limit || 200));
+
+  const ex = await getStoredEx(req.userId, exchange);
+  const rows = [];
+  const errors = [];
+  let maxTs = cursorSince;
+  let method = 'none';
+
+  try {
+    // Path 1 — positions (preferred). CCXT 4.4+ supports fetchPositionHistory
+    // on BingX/Bybit; binance perp exposes it too on newer builds.
+    if (typeof ex.fetchPositionHistory === 'function') {
+      try {
+        const positions = await ex.fetchPositionHistory(symbol || undefined, cursorSince, lim);
+        for (const p of positions || []) {
+          const row = rowFromPosition(p, req.userId, exchange);
+          if (!row) continue;
+          rows.push(row);
+          const t = +p.lastUpdateTimestamp || +p.timestamp || 0;
+          if (t > maxTs) maxTs = t;
+        }
+        if (rows.length > 0) method = 'fetchPositionHistory';
+      } catch (e) {
+        errors.push({ method: 'fetchPositionHistory', message: String(e.message || e).slice(0, 200) });
+      }
+    }
+
+    // Path 2 — closed orders (fallback). Always available, less rich.
+    if (rows.length === 0) {
+      try {
+        const orders = await ex.fetchClosedOrders(symbol || undefined, cursorSince, lim);
+        for (const o of orders || []) {
+          if (o.status !== 'closed' && o.status !== 'canceled') continue;
+          if (o.status === 'canceled') continue;
+          const row = rowFromOrder(o, req.userId, exchange);
+          if (!row) continue;
+          rows.push(row);
+          const t = +o.timestamp || +o.lastTradeTimestamp || 0;
+          if (t > maxTs) maxTs = t;
+        }
+        if (rows.length > 0) method = 'fetchClosedOrders';
+      } catch (e) {
+        errors.push({ method: 'fetchClosedOrders', message: String(e.message || e).slice(0, 200) });
+      }
+    }
+
+    let imported = 0;
+    if (rows.length > 0) {
+      // Idempotent upsert — repeat syncs collapse onto the same row by
+      // (telegram_user_id, exchange, exchange_order_id) thanks to the
+      // partial unique index added in sprint14_bingx_history_import migration.
+      const { error: upErr, data: upData } = await supabase.from('trades').upsert(
+        rows,
+        {
+          onConflict: 'telegram_user_id,exchange,exchange_order_id',
+          ignoreDuplicates: false,
+        }
+      ).select('id');
+      if (upErr) throw new Error(`upsert: ${upErr.message}`);
+      imported = (upData || []).length;
+    }
+
+    await supabase.from('exchange_sync_state').upsert({
+      telegram_user_id: req.userId,
+      exchange,
+      last_synced_at: new Date().toISOString(),
+      last_synced_until: maxTs,
+      total_imported: imported,
+      last_error: errors.length > 0 ? errors[0].message : null,
+    }, { onConflict: 'telegram_user_id,exchange' });
+
+    res.json({
+      ok: true,
+      imported,
+      skipped: 0,
+      errors,
+      method,
+      lastSync: maxTs,
+    });
+  } finally {
+    try { await ex.close?.(); } catch { /* */ }
+  }
+}));
+
+// Cron — daily 02:00 UTC sweep across every connected exchange for every user
+// whose state row is more than 23h stale. Best-effort, swallow per-user errors
+// so one broken key doesn't kill the whole batch.
+async function syncAllExchangeHistory() {
+  console.log('[CRON sync-history] starting');
+  const { data: conns, error } = await supabase.from('exchange_connections')
+    .select('telegram_user_id, exchange, api_key_enc, secret_enc');
+  if (error || !conns) {
+    console.error('[CRON sync-history] connections lookup failed:', error?.message);
+    return;
+  }
+  let processed = 0;
+  let imported = 0;
+  for (const conn of conns) {
+    try {
+      const { data: state } = await supabase.from('exchange_sync_state')
+        .select('last_synced_at, last_synced_until')
+        .eq('telegram_user_id', conn.telegram_user_id)
+        .eq('exchange', conn.exchange)
+        .maybeSingle();
+      // Skip rows synced in the last 23h
+      if (state?.last_synced_at) {
+        const ageMs = Date.now() - new Date(state.last_synced_at).getTime();
+        if (ageMs < 23 * 3_600_000) continue;
+      }
+      const since = state?.last_synced_until || (Date.now() - 90 * 86_400_000);
+      let ex = null;
+      const rows = [];
+      let maxTs = since;
+      try {
+        ex = mkEx(conn.exchange, decrypt(conn.api_key_enc), decrypt(conn.secret_enc));
+        if (!ex) continue;
+        if (typeof ex.fetchPositionHistory === 'function') {
+          try {
+            const positions = await ex.fetchPositionHistory(undefined, since, 200);
+            for (const p of positions || []) {
+              const row = rowFromPosition(p, conn.telegram_user_id, conn.exchange);
+              if (!row) continue;
+              rows.push(row);
+              const t = +p.lastUpdateTimestamp || +p.timestamp || 0;
+              if (t > maxTs) maxTs = t;
+            }
+          } catch { /* fall through */ }
+        }
+        if (rows.length === 0) {
+          try {
+            const orders = await ex.fetchClosedOrders(undefined, since, 200);
+            for (const o of orders || []) {
+              if (o.status !== 'closed') continue;
+              const row = rowFromOrder(o, conn.telegram_user_id, conn.exchange);
+              if (!row) continue;
+              rows.push(row);
+              const t = +o.timestamp || +o.lastTradeTimestamp || 0;
+              if (t > maxTs) maxTs = t;
+            }
+          } catch { /* */ }
+        }
+        if (rows.length > 0) {
+          await supabase.from('trades').upsert(rows, {
+            onConflict: 'telegram_user_id,exchange,exchange_order_id',
+            ignoreDuplicates: false,
+          });
+          imported += rows.length;
+        }
+        await supabase.from('exchange_sync_state').upsert({
+          telegram_user_id: conn.telegram_user_id,
+          exchange: conn.exchange,
+          last_synced_at: new Date().toISOString(),
+          last_synced_until: maxTs,
+          total_imported: rows.length,
+          last_error: null,
+        }, { onConflict: 'telegram_user_id,exchange' });
+        processed++;
+      } catch (e) {
+        console.error('[CRON sync-history]', conn.telegram_user_id, conn.exchange, e?.message);
+        await supabase.from('exchange_sync_state').upsert({
+          telegram_user_id: conn.telegram_user_id,
+          exchange: conn.exchange,
+          last_synced_at: new Date().toISOString(),
+          last_synced_until: maxTs,
+          total_imported: 0,
+          last_error: String(e?.message || e).slice(0, 500),
+        }, { onConflict: 'telegram_user_id,exchange' });
+      } finally {
+        try { await ex?.close?.(); } catch { /* */ }
+      }
+    } catch (outer) {
+      console.error('[CRON sync-history outer]', outer?.message);
+    }
+  }
+  console.log(`[CRON sync-history] done — processed ${processed}, imported ${imported}`);
+}
+
 // Sprint 9A · Live monitor — single-call snapshot of open positions across ALL
 // of the user's connected exchanges. The existing POST /api/exchange/positions
 // is per-exchange (frontend would have to N+1 it), this fans out server-side,
@@ -1304,6 +1599,13 @@ cron.schedule('0 10 * * *', sendReminders);
 // Always wrap in try/catch so cron doesn't crash on a single bad row.
 cron.schedule('0 3 * * *', () => {
   evaluateInsightOutcomes().catch((e) => console.error('[coach/cron]', e?.message || e));
+});
+
+// Sprint 14 — daily 02:00 UTC sweep of exchange history across every
+// connected user. Best-effort; per-user errors are logged + persisted in
+// exchange_sync_state.last_error but never crash the whole batch.
+cron.schedule('0 2 * * *', () => {
+  syncAllExchangeHistory().catch((e) => console.error('[sync-history/cron]', e?.message || e));
 });
 
 // ── Error handlers ────────────────────────────────────────────────────────────
