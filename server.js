@@ -1307,6 +1307,51 @@ cron.schedule('0 3 * * *', () => {
 });
 
 // ── Error handlers ────────────────────────────────────────────────────────────
+
+// ═══ User Profile (editable) ═══════════════════════════════════════════════
+app.get('/api/me', requireAuth, wrap(async (req, res) => {
+  const { data, error } = await supabase
+    .from('users')
+    .select('telegram_user_id, username, first_name, last_name, display_name, email, timezone, reporting_currency, start_balance, language_code, points_balance')
+    .eq('telegram_user_id', req.userId)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  res.json({ ok: true, user: data });
+}));
+
+app.put('/api/me', requireAuth, wrap(async (req, res) => {
+  const allowed = ['display_name','email','timezone','reporting_currency','start_balance','language_code'];
+  const upd = { updated_at: new Date().toISOString() };
+  for (const k of allowed) {
+    if (req.body[k] !== undefined) {
+      if (k === 'email' && req.body.email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(req.body.email)) {
+        return res.status(400).json({ ok: false, error: 'invalid email' });
+      }
+      if (k === 'timezone' && req.body.timezone) {
+        // Basic validation — must be Continent/City format or UTC[+-]N
+        const tz = String(req.body.timezone);
+        if (!/^([A-Z][a-z]+\/[A-Z][a-zA-Z_]+|UTC[+-]?\d{0,2})$/.test(tz)) {
+          return res.status(400).json({ ok: false, error: 'invalid timezone' });
+        }
+      }
+      if (k === 'reporting_currency' && req.body.reporting_currency) {
+        if (!/^[A-Z]{3}$/.test(req.body.reporting_currency)) {
+          return res.status(400).json({ ok: false, error: 'currency must be 3-letter code (USD, EUR, RUB)' });
+        }
+      }
+      upd[k] = req.body[k];
+    }
+  }
+  const { data, error } = await supabase
+    .from('users')
+    .update(upd)
+    .eq('telegram_user_id', req.userId)
+    .select('telegram_user_id, display_name, email, timezone, reporting_currency, start_balance, language_code')
+    .single();
+  if (error) throw new Error(error.message);
+  res.json({ ok: true, user: data });
+}));
+
 app.use((req, res) => res.status(404).json({ ok: false, error: `Not found: ${req.method} ${req.path}` }));
 app.use((err, req, res, _next) => {
   if (err.message === 'CORS blocked') return res.status(403).json({ ok: false, error: 'Origin not allowed' });
