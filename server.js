@@ -825,6 +825,48 @@ app.delete('/api/trades/:id', requireAuth, wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
+// Sprint 22 — bulk-delete trades by source and/or exchange. Used by the
+// /exchanges «Удалить импорт» button to clean up a stale or wrong import
+// pass. POST body required to make this hard to accidentally trigger via a
+// stray GET / browser bookmark / refresh — exactly the kind of thing we
+// don't want for a destructive operation. Always scoped to the calling
+// user via telegram_user_id; cannot delete other users' rows even with a
+// forged body.
+//
+// body: { source?: 'import_bingx' | 'import_binance' | 'import_bybit', exchange?: 'bingx'|'binance'|'bybit' }
+// At least one of `source` or `exchange` must be present.
+// returns: { ok: true, deleted: <n> }
+app.post('/api/trades/bulk-delete', requireAuth, wrap(async (req, res) => {
+  const { source, exchange } = req.body || {};
+  if (!source && !exchange) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Validation: specify source (e.g. "import_bingx") or exchange',
+    });
+  }
+  let q = supabase.from('trades').delete().eq('telegram_user_id', req.userId);
+  if (source)   q = q.eq('source', source);
+  if (exchange) q = q.eq('exchange', exchange);
+  const { data, error } = await q.select('id');
+  if (error) throw new Error(`bulk-delete: ${error.message}`);
+  const deleted = (data || []).length;
+
+  // Best-effort: when scoping by exchange (or a source like import_bingx),
+  // also reset the matching exchange_sync_state row so the next sync starts
+  // with a fresh 90d window instead of resuming from a now-stale cursor.
+  if (deleted > 0) {
+    const ex = exchange || (source && source.startsWith('import_') ? source.slice('import_'.length) : null);
+    if (ex) {
+      await supabase.from('exchange_sync_state')
+        .delete()
+        .eq('telegram_user_id', req.userId)
+        .eq('exchange', ex);
+    }
+  }
+
+  res.json({ ok: true, deleted });
+}));
+
 // ── Uploads (Sprint 5: Journal screenshots) ───────────────────────────────────
 // Multer in-memory storage, 5MB limit, image MIME whitelist.
 // Owner enforced server-side: path = {telegram_user_id}/{trade_id}/{uuid}.{ext}
