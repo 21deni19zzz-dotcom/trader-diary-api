@@ -1225,7 +1225,13 @@ app.post('/api/exchange/sync-history', requireAuth, wrap(async (req, res) => {
       last_synced_at: new Date().toISOString(),
       last_synced_until: maxTs,
       total_imported: imported,
-      last_error: errors.length > 0 ? errors[0].message : null,
+      // Sprint 20 hotfix — only persist `last_error` when we ACTUALLY failed
+      // to import anything. When path-1 (fetchPositionHistory) throws but
+      // path-2 (fetchClosedOrders) succeeds we still imported rows, so a
+      // stale error message reading «Last error: Cannot read ...» on the UI
+      // misleads the user into thinking the sync broke. Transient errors
+      // still come back in the response `errors[]` array for diagnostics.
+      last_error: (errors.length > 0 && imported === 0) ? errors[0].message : null,
     }, { onConflict: 'telegram_user_id,exchange' });
 
     res.json({
