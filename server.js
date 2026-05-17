@@ -1077,32 +1077,165 @@ function rowFromPosition(p, userId, exchange) {
   };
 }
 
-// Build a `trades` row from a CCXT closed order. Less rich than a position
-// record — we don't know the entry/exit pair, so we record the fill as a
-// single-leg closed trade and leave PnL null for the user to edit.
-function rowFromOrder(o, userId, exchange) {
-  const orderId = o.id || o.info?.orderId || o.info?.id || null;
-  if (!orderId) return null;
-  const filled = +o.filled || +o.amount || 0;
-  if (!filled) return null;
-  const avg = +o.average || +o.price || 0;
-  if (!avg) return null;
-  const side = normalizeSide(o.side);
-  const ts = +o.timestamp || +o.lastTradeTimestamp || 0;
+// Sprint 20.2 — pair closed orders into trades using FIFO matching by symbol.
+// Replaces the old `rowFromOrder` 1-order-per-trade approach which produced
+// entry===exit===fill_price (P&L always 0). Here a real round-trip needs both
+// a BUY and a SELL — we match them in time order. Unmatched orders (e.g. a
+// SELL whose corresponding BUY is older than the sync window) are skipped:
+// honest «no trade imported» beats a fake $0 row.
+function pairOrdersToTrades(orders, userId, exchange) {
+  const bySymbol = new Map();
+  for (const o of orders || []) {
+    if (!o?.symbol) continue;
+    if (o.status && o.status !== 'closed') continue;
+    if (!bySymbol.has(o.symbol)) bySymbol.set(o.symbol, []);
+    bySymbol.get(o.symbol).push(o);
+  }
+
+  const trades = [];
+
+  for (const [symbol, syms] of bySymbol) {
+    syms.sort((a, b) => (+a.timestamp || 0) - (+b.timestamp || 0));
+    const longQueue = [];   // open longs:  { qty, price, ts, orderId }
+    const shortQueue = [];  // open shorts: same shape
+
+    for (const o of syms) {
+      const side = String(o.side || '').toLowerCase();
+      const filled = +o.filled || +o.amount || 0;
+      const price = +o.average || +o.price || 0;
+      const ts = +o.timestamp || +o.lastTradeTimestamp || 0;
+      const orderId = o.id || o.info?.orderId || o.info?.id;
+      if (!filled || !price || !orderId) continue;
+
+      const push = (direction, entry, exit, qty, openTs, closeTs, pnl) => trades.push({
+        telegram_user_id: userId,
+        symbol,
+        direction,
+        status: 'closed',
+        entry_price: entry,
+        exit_price: exit,
+        quantity: qty,
+        entry_date: ymd(openTs),
+        exit_date:  ymd(closeTs),
+        pnl: parseFloat(pnl.toFixed(2)),
+        exchange,
+        exchange_order_id: String(orderId),
+        exchange_position_id: null,
+        source: 'import_' + exchange,
+      });
+
+      if (side === 'buy') {
+        // BUY closes shorts FIFO, leftover opens a long.
+        let remaining = filled;
+        while (remaining > 0 && shortQueue.length > 0) {
+          const open = shortQueue[0];
+          const matched = Math.min(remaining, open.qty);
+          push('short', open.price, price, matched, open.ts, ts, (open.price - price) * matched);
+          open.qty -= matched;
+          remaining -= matched;
+          if (open.qty <= 1e-9) shortQueue.shift();
+        }
+        if (remaining > 1e-9) longQueue.push({ qty: remaining, price, ts, orderId: String(orderId) });
+      } else if (side === 'sell') {
+        // SELL closes longs FIFO, leftover opens a short.
+        let remaining = filled;
+        while (remaining > 0 && longQueue.length > 0) {
+          const open = longQueue[0];
+          const matched = Math.min(remaining, open.qty);
+          push('long', open.price, price, matched, open.ts, ts, (price - open.price) * matched);
+          open.qty -= matched;
+          remaining -= matched;
+          if (open.qty <= 1e-9) longQueue.shift();
+        }
+        if (remaining > 1e-9) shortQueue.push({ qty: remaining, price, ts, orderId: String(orderId) });
+      }
+    }
+    // Anything still in longQueue/shortQueue is an open position — not a
+    // closed trade — intentionally skipped.
+  }
+
+  return trades;
+}
+
+// Sprint 20.2 — BingX direct REST positionHistory. Bypasses the CCXT BingX
+// position parser which throws «Cannot read properties of undefined» on the
+// shape BingX returns today. Returns CCXT-compatible position-like objects
+// so the rest of the sync pipeline doesn't care which source was used.
+async function fetchBingXPositionHistoryDirect(creds, since, limit) {
+  const params = new URLSearchParams();
+  params.set('timestamp', String(Date.now()));
+  params.set('pageSize', String(Math.min(100, Math.max(10, limit || 100))));
+  if (since && Number.isFinite(+since)) params.set('startTs', String(Math.floor(+since)));
+
+  const query = params.toString();
+  const signature = crypto.createHmac('sha256', creds.secret).update(query).digest('hex');
+  const url = `https://open-api.bingx.com/openApi/swap/v2/trade/positionHistory?${query}&signature=${signature}`;
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15_000);
+  let data;
+  try {
+    const res = await fetch(url, { method: 'GET', headers: { 'X-BX-APIKEY': creds.apiKey }, signal: ctrl.signal });
+    data = await res.json().catch(() => ({}));
+  } finally {
+    clearTimeout(timer);
+  }
+  if (data?.code !== 0) {
+    throw new Error(`BingX positionHistory: ${data?.msg || `code ${data?.code}`}`);
+  }
+  return data?.data?.positionHistory || [];
+}
+
+// Decrypt creds (raw) for direct REST flows that don't go through CCXT.
+async function getStoredCreds(userId, exId) {
+  valEx(exId);
+  const { data } = await supabase.from('exchange_connections')
+    .select('api_key_enc, secret_enc')
+    .eq('telegram_user_id', userId).eq('exchange', exId).single();
+  if (!data) throw new Error('Not found: Exchange not connected');
+  return { apiKey: decrypt(data.api_key_enc), secret: decrypt(data.secret_enc) };
+}
+
+// Build a `trades` row from a BingX REST positionHistory record.
+// BingX shape: { positionId, symbol="BTC-USDT", positionSide="LONG"|"SHORT",
+//                positionAmt, avgPrice (entry), avgClosePrice (exit),
+//                netProfit, realisedProfit, openTime, updateTime, leverage }
+function rowFromBingXPosition(p, userId, exchange) {
+  if (!p?.positionId) return null;
+  const direction = (String(p.positionSide || '').toLowerCase() === 'short') ? 'short' : 'long';
+  const qty = Math.abs(parseFloat(p.positionAmt || 0));
+  const entry = parseFloat(p.avgPrice || 0);
+  const exit  = parseFloat(p.avgClosePrice || 0);
+  const realizedPnl = parseFloat(
+    p.netProfit != null ? p.netProfit : (p.realisedProfit != null ? p.realisedProfit : NaN)
+  );
+  const openTs  = +p.openTime  || 0;
+  const closeTs = +p.updateTime || openTs;
+  if (!qty || !entry || !exit) return null;
+
+  // Normalize symbol to CCXT-style. BingX returns "BTC-USDT"; we use
+  // "BTC/USDT:USDT" so the rest of the app (TradingView lookup, calcPnL,
+  // pair filters) sees the same shape as CCXT path.
+  let sym = String(p.symbol || '');
+  if (sym.includes('-')) {
+    const [base, quote] = sym.split('-');
+    sym = `${base}/${quote}:${quote}`;
+  }
+
   return {
     telegram_user_id: userId,
-    symbol: o.symbol,
-    direction: side,
+    symbol: sym,
+    direction,
     status: 'closed',
-    entry_price: avg,
-    exit_price: avg,
-    quantity: filled,
-    entry_date: ymd(ts),
-    exit_date:  ymd(ts),
-    pnl: null,
+    entry_price: entry,
+    exit_price: exit,
+    quantity: qty,
+    entry_date: ymd(openTs),
+    exit_date:  ymd(closeTs),
+    pnl: Number.isFinite(realizedPnl) ? realizedPnl : null,
     exchange,
-    exchange_order_id: String(orderId),
-    exchange_position_id: null,
+    exchange_order_id: String(p.positionId),
+    exchange_position_id: String(p.positionId),
     source: 'import_' + exchange,
   };
 }
@@ -1145,9 +1278,30 @@ app.post('/api/exchange/sync-history', requireAuth, wrap(async (req, res) => {
   let method = 'none';
 
   try {
-    // Path 1 — positions (preferred). CCXT 4.4+ supports fetchPositionHistory
-    // on BingX/Bybit; binance perp exposes it too on newer builds.
-    if (typeof ex.fetchPositionHistory === 'function') {
+    // ── Path 1a — BingX direct REST positionHistory ──────────────────────
+    // CCXT's BingX position parser throws «Cannot read properties of
+    // undefined» on the response shape BingX returns today. Call BingX
+    // REST directly, get clean records with realized PnL, parse into
+    // CCXT-compatible row shape via rowFromBingXPosition.
+    if (exchange === 'bingx') {
+      try {
+        const creds = await getStoredCreds(req.userId, exchange);
+        const positions = await fetchBingXPositionHistoryDirect(creds, cursorSince, lim);
+        for (const p of positions) {
+          const row = rowFromBingXPosition(p, req.userId, exchange);
+          if (!row) continue;
+          rows.push(row);
+          const t = +p.updateTime || +p.openTime || 0;
+          if (t > maxTs) maxTs = t;
+        }
+        if (rows.length > 0) method = 'bingxRest';
+      } catch (e) {
+        errors.push({ method: 'bingxRest', message: String(e.message || e).slice(0, 200) });
+      }
+    }
+
+    // ── Path 1b — CCXT fetchPositionHistory (Bybit/Binance perp) ──────────
+    if (rows.length === 0 && typeof ex.fetchPositionHistory === 'function') {
       try {
         const positions = await ex.fetchPositionHistory(symbol || undefined, cursorSince, lim);
         for (const p of positions || []) {
@@ -1163,20 +1317,21 @@ app.post('/api/exchange/sync-history', requireAuth, wrap(async (req, res) => {
       }
     }
 
-    // Path 2 — closed orders (fallback). Always available, less rich.
+    // ── Path 2 — closed orders + FIFO pairing (fallback) ──────────────────
+    // Replaces the old rowFromOrder 1-order-per-trade approach, which set
+    // entry===exit===fill_price and produced P&L=0 for every imported row.
+    // pairOrdersToTrades matches BUY↔SELL by timestamp per symbol so each
+    // trade reflects a real round-trip with proper entry / exit / P&L.
     if (rows.length === 0) {
       try {
         const orders = await ex.fetchClosedOrders(symbol || undefined, cursorSince, lim);
+        const paired = pairOrdersToTrades(orders || [], req.userId, exchange);
+        rows.push(...paired);
         for (const o of orders || []) {
-          if (o.status !== 'closed' && o.status !== 'canceled') continue;
-          if (o.status === 'canceled') continue;
-          const row = rowFromOrder(o, req.userId, exchange);
-          if (!row) continue;
-          rows.push(row);
           const t = +o.timestamp || +o.lastTradeTimestamp || 0;
           if (t > maxTs) maxTs = t;
         }
-        if (rows.length > 0) method = 'fetchClosedOrders';
+        if (rows.length > 0) method = 'fetchClosedOrders+pair';
       } catch (e) {
         errors.push({ method: 'fetchClosedOrders', message: String(e.message || e).slice(0, 200) });
       }
