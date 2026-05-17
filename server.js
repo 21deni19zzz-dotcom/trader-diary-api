@@ -76,7 +76,7 @@ app.use(cors({
     cb(new Error('CORS blocked'));
   },
   credentials: true,
-  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
@@ -1990,9 +1990,11 @@ app.put('/api/me', requireAuth, wrap(async (req, res) => {
         return res.status(400).json({ ok: false, error: 'invalid email' });
       }
       if (k === 'timezone' && req.body.timezone) {
-        // Basic validation — must be Continent/City format or UTC[+-]N
+        // Basic validation — supports multi-segment paths like
+        // 'America/Argentina/Buenos_Aires' (3 segments, in the dropdown
+        // since Sprint 8a) as well as standard 'Continent/City' and UTC offsets.
         const tz = String(req.body.timezone);
-        if (!/^([A-Z][a-z]+\/[A-Z][a-zA-Z_]+|UTC[+-]?\d{0,2})$/.test(tz)) {
+        if (!/^(([A-Z][a-z]+(?:_[A-Z][a-z]+)*\/)+[A-Z][a-zA-Z_]+|UTC[+-]?\d{0,2})$/.test(tz)) {
           return res.status(400).json({ ok: false, error: 'invalid timezone' });
         }
       }
