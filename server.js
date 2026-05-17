@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 import { createClient } from '@supabase/supabase-js';
 import multer from 'multer';
 import 'dotenv/config';
+import { fetchBingXFundingHistory, fetchFundingHistoryCcxt, matchFundingToTrades } from './funding.js';
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -1431,6 +1432,52 @@ app.post('/api/exchange/sync-history', requireAuth, wrap(async (req, res) => {
       last_error: (errors.length > 0 && imported === 0) ? errors[0].message : null,
     }, { onConflict: 'telegram_user_id,exchange' });
 
+    // ── Sprint 23.B — funding pass ─────────────────────────────────────
+    // After trades land, pull funding history for the same window and
+    // attribute each funding event to its parent trade by symbol +
+    // timestamp window. Stored on `trades.funding_fees` so the FE can
+    // compose net P&L = pnl + funding_fees for display. Funding errors
+    // are non-fatal — surfaced in the response `errors[]` array.
+    let fundingUpdated = 0;
+    try {
+      let fundingEvents = [];
+      if (exchange === 'bingx') {
+        const creds = await getStoredCreds(req.userId, exchange);
+        fundingEvents = await fetchBingXFundingHistory(creds.apiKey, creds.secret, cursorSince);
+      } else if (typeof ex.fetchFundingHistory === 'function') {
+        fundingEvents = await fetchFundingHistoryCcxt(ex, cursorSince);
+      }
+      if (fundingEvents.length > 0) {
+        const { data: rowsForFunding } = await supabase
+          .from('trades')
+          .select('id, symbol, entry_date, exit_date')
+          .eq('telegram_user_id', req.userId)
+          .eq('exchange', exchange)
+          .eq('status', 'closed');
+        const fundingByTrade = matchFundingToTrades(fundingEvents, rowsForFunding || []);
+        if (fundingByTrade.size > 0) {
+          const nowIso = new Date().toISOString();
+          // Per-row update — Supabase JS doesn't support batch column
+          // patches from a Map. Promise.all keeps total wall time low
+          // for the typical handful of rows per sync.
+          await Promise.all(
+            Array.from(fundingByTrade).map(([tradeId, fundingSum]) =>
+              supabase.from('trades').update({
+                funding_fees: parseFloat(fundingSum.toFixed(8)),
+                funding_synced_at: nowIso,
+              }).eq('id', tradeId).eq('telegram_user_id', req.userId)
+            )
+          );
+          fundingUpdated = fundingByTrade.size;
+        }
+      }
+    } catch (fundingErr) {
+      errors.push({
+        method: 'funding',
+        message: String(fundingErr?.message || fundingErr).slice(0, 200),
+      });
+    }
+
     res.json({
       ok: true,
       imported,
@@ -1438,6 +1485,7 @@ app.post('/api/exchange/sync-history', requireAuth, wrap(async (req, res) => {
       errors,
       method,
       lastSync: maxTs,
+      fundingUpdated,
     });
   } finally {
     try { await ex.close?.(); } catch { /* */ }
