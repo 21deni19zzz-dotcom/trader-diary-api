@@ -1167,18 +1167,39 @@ app.post('/api/exchange/sync-history', requireAuth, wrap(async (req, res) => {
 
     let imported = 0;
     if (rows.length > 0) {
-      // Idempotent upsert — repeat syncs collapse onto the same row by
-      // (telegram_user_id, exchange, exchange_order_id) thanks to the
-      // partial unique index added in sprint14_bingx_history_import migration.
-      const { error: upErr, data: upData } = await supabase.from('trades').upsert(
-        rows,
-        {
-          onConflict: 'telegram_user_id,exchange,exchange_order_id',
-          ignoreDuplicates: false,
-        }
-      ).select('id');
-      if (upErr) throw new Error(`upsert: ${upErr.message}`);
-      imported = (upData || []).length;
+      // App-level dedup. Sprint 20 — the historical unique index
+      // `uq_trades_exchange_order` is a PARTIAL index with
+      // `WHERE exchange_order_id IS NOT NULL`. PostgreSQL's `ON CONFLICT`
+      // requires the conflict-target arbiter index's WHERE predicate to
+      // match exactly, and Supabase's `.upsert({ onConflict: 'cols' })`
+      // cannot pass a WHERE predicate — so the call failed at runtime with
+      // `there is no unique or exclusion constraint matching the ON CONFLICT
+      // specification`. Instead of dropping/recreating the index (DB
+      // migration → STOP-GATE), we dedup app-side: SELECT existing
+      // exchange_order_ids for this (user, exchange), filter them out, then
+      // plain INSERT the new ones. Safe under the 30s per-(user,exchange)
+      // cooldown — no concurrent sync run for the same key.
+      const orderIds = rows.map((r) => r.exchange_order_id).filter(Boolean);
+      let existing = new Set();
+      if (orderIds.length > 0) {
+        const { data: existingRows, error: selErr } = await supabase
+          .from('trades')
+          .select('exchange_order_id')
+          .eq('telegram_user_id', req.userId)
+          .eq('exchange', exchange)
+          .in('exchange_order_id', orderIds);
+        if (selErr) throw new Error(`dedup-select: ${selErr.message}`);
+        existing = new Set((existingRows || []).map((r) => r.exchange_order_id));
+      }
+      const newRows = rows.filter((r) => !existing.has(r.exchange_order_id));
+      if (newRows.length > 0) {
+        const { data: insData, error: insErr } = await supabase
+          .from('trades')
+          .insert(newRows)
+          .select('id');
+        if (insErr) throw new Error(`insert: ${insErr.message}`);
+        imported = (insData || []).length;
+      }
     }
 
     await supabase.from('exchange_sync_state').upsert({
