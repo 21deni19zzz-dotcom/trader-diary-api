@@ -615,6 +615,54 @@ app.post('/api/webhook/telegram', wrap(async (req, res) => {
     } catch (e) { console.error('Webhook error:', e.message); }
     return;
   }
+  // Sprint 18 — "🔑 Мой токен" / /token / /mytoken — show the user's CURRENT
+  // live token WITHOUT rotating it. This is the common case after a payment:
+  // customer lost the message, switched devices, cleared localStorage and just
+  // wants to re-copy their existing token. The /access path below rotates the
+  // token (revokes old, issues fresh) — correct for recovery but wrong for
+  // re-copy: it invalidates the token the user already saved in their password
+  // manager. Two paths, two intents, both supported.
+  const tokenText = upd.message?.text || '';
+  const isTokenRequest = (
+    tokenText === '/token' ||
+    tokenText === '/mytoken' ||
+    tokenText === '🔑 Мой токен'
+  );
+  if (isTokenRequest && upd.message?.from) {
+    const tg = upd.message.from;
+    try {
+      const { data: tok } = await supabase.from('auth_tokens')
+        .select('token, expires_at')
+        .eq('telegram_user_id', tg.id)
+        .eq('revoked', false)
+        .gt('expires_at', new Date().toISOString())
+        .order('expires_at', { ascending: false })
+        .limit(1).maybeSingle();
+      if (!tok) {
+        // No live token. Either the subscription expired (revoke cron 10:00 UTC),
+        // or all tokens are revoked from a prior /access cycle without renewal.
+        // Point the user at recovery (/access) and renewal (@ParadoxxShop_bot) —
+        // never silently issue a fresh token here, as that would conceal that the
+        // user has no active subscription.
+        await tgSend(tg.id,
+          `❌ <b>Активного токена нет</b>\n\nЛибо подписка истекла, либо все токены отозваны.\n\n🎫 <b>Получить новый:</b> отправь /access\n🛍 <b>Продлить подписку:</b> @ParadoxxShop_bot`);
+        return;
+      }
+      // Modern #token= fragment format — auth.jsx accepts both this and the
+      // legacy ?token= since Sprint 15 PR #45. Fragments aren't sent in HTTP
+      // Referer headers, so the token can't leak via outbound link clicks.
+      const link = `${FRONTEND}/#token=${tok.token}`;
+      const exp = new Date(tok.expires_at).toLocaleDateString('ru-RU');
+      await tgSend(tg.id,
+        `🔑 <b>Твой токен доступа</b>\n\n<code>${tok.token}</code>\n\n📅 Действует до: <b>${exp}</b>\n\n💡 <b>Как использовать:</b>\n• Tap на токен выше — скопируется автоматически\n• Или кнопка ниже — войдёт одним кликом\n\n⚠️ Не передавай токен третьим лицам.`,
+        { reply_markup: { inline_keyboard: [[{ text: '🚀 Открыть PTJ', url: link }]] } });
+    } catch (e) {
+      console.error('[/token]', e.message);
+      await tgSend(tg.id, `⚠️ Не удалось получить токен. Попробуй через минуту.`);
+    }
+    return;
+  }
+
   // Sprint 9.5: /access, /login, or "🎫 Мои доступы" — issue fresh login link
   // for a user with an active subscription. Replaces the manual purchase-link
   // recovery path when a token has been revoked by the daily expiry cron.
@@ -622,7 +670,8 @@ app.post('/api/webhook/telegram', wrap(async (req, res) => {
   const isAccessRequest = (
     accessText.startsWith('/access') ||
     accessText.startsWith('/login')  ||
-    accessText === '🎫 Мои доступы'
+    accessText === '🎫 Мои доступы'  ||  // legacy keyboard label
+    accessText === '🎫 Обновить токен'   // Sprint 18 — new label
   );
   if (isAccessRequest && upd.message?.from) {
     const tg = upd.message.from;
@@ -677,7 +726,7 @@ app.post('/api/webhook/telegram', wrap(async (req, res) => {
       const link = `${FRONTEND}?token=${tok.token}`;
       const exp  = new Date(sub.expires_at).toLocaleDateString('ru-RU');
       await tgSend(tg.id,
-        `🎫 <b>Доступ обновлён</b>\n\n📅 Подписка до: <b>${exp}</b>\n\n🔗 <b>Открыть PTJ:</b>\n${link}\n\n💡 Старый токен теперь недействителен.`,
+        `🎫 <b>Доступ обновлён</b>\n\n📅 Подписка до: <b>${exp}</b>\n\n🔗 <b>Открыть PTJ:</b>\n${link}\n\n💡 Старый токен теперь недействителен.\n\n🔑 Чтобы посмотреть текущий токен без обновления — нажми «🔑 Мой токен» или отправь /token.`,
         { reply_markup: { inline_keyboard: [[{ text: '🎫 Открыть PTJ', url: link }]] } });
     } catch (e) {
       console.error('[/access]', e.message);
@@ -689,8 +738,8 @@ app.post('/api/webhook/telegram', wrap(async (req, res) => {
   if (upd.message?.text?.startsWith('/start')) {
     const tg = upd.message.from;
     await tgSend(tg.id,
-      `👋 <b>Привет, ${tg.first_name}!</b>\n\n📊 <b>Trader Diary</b> — профессиональный торговый журнал.\n\n• Binance / Bybit / BingX\n• P&L с нашими формулами\n• Аналитика + equity curve\n\n🛍 Купить: @ParadoxxShop_bot\n🎫 Уже купил? Нажми «Мои доступы» ниже или отправь /access.`,
-      { reply_markup: { keyboard: [[{ text: '🎫 Мои доступы' }]], resize_keyboard: true } });
+      `👋 <b>Привет, ${tg.first_name}!</b>\n\n📊 <b>Trader Diary</b> — профессиональный торговый журнал.\n\n• Binance / Bybit / BingX\n• P&L с нашими формулами\n• Аналитика + equity curve\n\n🛍 Купить: @ParadoxxShop_bot\n\n<b>Кабинет:</b>\n🔑 <b>Мой токен</b> — скопировать текущий токен (без сброса)\n🎫 <b>Обновить токен</b> — выдать новый (старый перестанет работать)`,
+      { reply_markup: { keyboard: [[{ text: '🔑 Мой токен' }, { text: '🎫 Обновить токен' }]], resize_keyboard: true } });
   }
 }));
 
