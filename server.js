@@ -628,7 +628,7 @@ app.post('/api/webhook/telegram', wrap(async (req, res) => {
     const tg = upd.message.from;
     try {
       const { data: sub } = await supabase.from('subscriptions')
-        .select('id, expires_at').eq('telegram_user_id', tg.id)
+        .select('id, product_id, expires_at').eq('telegram_user_id', tg.id)
         .in('status', ['active', 'trial']).gt('expires_at', new Date().toISOString())
         .order('expires_at', { ascending: false }).limit(1).maybeSingle();
       if (!sub) {
@@ -641,6 +641,28 @@ app.post('/api/webhook/telegram', wrap(async (req, res) => {
         telegram_user_id: tg.id, expires_at: sub.expires_at,
       }).select('token, expires_at').single();
       if (tokErr) throw new Error(`auth_tokens insert: ${tokErr.message}`);
+
+      // Sprint 16 (B1 closure for /access) — same dual-sync as /refresh,
+      // /extend-from-bot, and payment_success. Without this, the bot rotates
+      // auth_tokens but leaves subscriptions.telegram_invite_link pointing
+      // at the OLD token and user_accesses.expires_at stale, so the next
+      // "🎫 Мои доступы" tap or another consumer reading from those tables
+      // would land on a 401. Best-effort — rotation already succeeded.
+      const inviteLink = `${FRONTEND}/?token=${tok.token}`;
+      const { error: subSyncErr } = await supabase.from('subscriptions')
+        .update({ telegram_invite_link: inviteLink, updated_at: new Date().toISOString() })
+        .eq('telegram_user_id', tg.id)
+        .in('status', ['active', 'trial']);
+      if (subSyncErr) console.error('[/access] subscription invite_link sync:', subSyncErr.message);
+
+      if (sub.product_id) {
+        const { error: uaErr } = await supabase.from('user_accesses')
+          .update({ expires_at: sub.expires_at })
+          .eq('telegram_user_id', tg.id)
+          .eq('product_id', sub.product_id)
+          .is('revoked_at', null);
+        if (uaErr) console.error('[/access] user_accesses expires_at sync:', uaErr.message);
+      }
 
       // Key on the Telegram update_id so a webhook retry (5xx / network)
       // dedupes against the UNIQUE constraint on telegram_events.idempotency_key.
