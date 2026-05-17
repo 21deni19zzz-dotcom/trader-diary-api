@@ -954,12 +954,24 @@ app.post('/api/exchange/connect', requireAuth, wrap(async (req, res) => {
   res.json({ ok: true, exchange, balance: +(bal.total?.USDT || 0).toFixed(2) });
 }));
 
-// Saved connections list
+// Saved connections list. Sprint 20 — also returns the per-exchange sync state
+// (last_synced_at, last_synced_until, total_imported, last_error) so the frontend
+// can surface a sync history badge + last error WITHOUT triggering another sync.
 app.get('/api/exchange/connections', requireAuth, wrap(async (req, res) => {
-  const { data } = await supabase.from('exchange_connections')
-    .select('exchange, connected_at, last_used_at')
-    .eq('telegram_user_id', req.userId);
-  res.json({ ok: true, connections: data || [] });
+  const [connsRes, statesRes] = await Promise.all([
+    supabase.from('exchange_connections')
+      .select('exchange, connected_at, last_used_at')
+      .eq('telegram_user_id', req.userId),
+    supabase.from('exchange_sync_state')
+      .select('exchange, last_synced_at, last_synced_until, total_imported, last_error')
+      .eq('telegram_user_id', req.userId),
+  ]);
+  const stateMap = new Map((statesRes.data || []).map((s) => [s.exchange, s]));
+  const enriched = (connsRes.data || []).map((c) => ({
+    ...c,
+    sync_state: stateMap.get(c.exchange) || null,
+  }));
+  res.json({ ok: true, connections: enriched });
 }));
 
 // Disconnect
@@ -1096,7 +1108,7 @@ function rowFromOrder(o, userId, exchange) {
 }
 
 app.post('/api/exchange/sync-history', requireAuth, wrap(async (req, res) => {
-  const { exchange, symbol, since, limit } = req.body || {};
+  const { exchange, symbol, since, limit, force_full_sync } = req.body || {};
   valEx(exchange);
 
   // Cooldown — defend the exchange's own rate limiter from over-eager users.
@@ -1111,9 +1123,14 @@ app.post('/api/exchange/sync-history', requireAuth, wrap(async (req, res) => {
   }
   syncCooldown.set(key, Date.now());
 
-  // Cursor — resume where the last sync stopped, or default to last 90 days.
+  // Cursor.
+  //   - explicit `since` → use it (millis since epoch).
+  //   - `force_full_sync: true` → reset to 180 days ago (BingX/Binance cap ~6mo).
+  //   - otherwise → resume from exchange_sync_state.last_synced_until, default 90d.
   let cursorSince = Number.isFinite(+since) ? +since : null;
-  if (cursorSince == null) {
+  if (cursorSince == null && force_full_sync === true) {
+    cursorSince = Date.now() - 180 * 86_400_000;
+  } else if (cursorSince == null) {
     const { data: state } = await supabase.from('exchange_sync_state')
       .select('last_synced_until')
       .eq('telegram_user_id', req.userId).eq('exchange', exchange).maybeSingle();
